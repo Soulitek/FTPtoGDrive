@@ -1,0 +1,61 @@
+# Logs
+*.log
+logs/
+C:/Logs/
+
+# Temporary backup files
+*.tar.gz
+*.zip
+*.bak
+*.tmp
+
+# PowerShell module cache
+PSModuleCache/
+
+# User-specific files
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Windows image file caches
+Thumbs.db
+ehthumbs.db
+
+# Folder config file
+Desktop.ini
+
+# Recycle Bin
+$RECYCLE.BIN/
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# MacOS
+.DS_Store
+
+# Backup files
+*~
+*.swp
+*.swo
+
+# Credential files (should never be in repo)
+credentials.json
+*.key
+*.pem
+id_rsa
+id_rsa.pub
+
+# Local test files
+test/
+temp/
+tmp/
+
+# Customer-specific configuration
+customer-config.json
+*.local.ps1
+
+# Internal workflow files
+workflow_state.md
+.workflow/
