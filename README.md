@@ -1,6 +1,6 @@
-# Website Backup System
+# FTPtoGdrive - Via Rclone
 
-PowerShell-based automated website backups with Google Drive integration.
+PowerShell-based automated website backups with Google Drive integration via Rclone.
 
 ## Quick Start
 
