@@ -151,6 +151,18 @@ function Test-IsFirstRun {
     return $false
 }
 
+function Test-IsAdministrator {
+    <#
+    .SYNOPSIS
+        Checks if the current PowerShell session is running with administrator privileges.
+    #>
+    [CmdletBinding()]
+    param()
+    
+    $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    return $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
 function Write-ColorMessage {
     <#
     .SYNOPSIS
@@ -347,6 +359,13 @@ function Show-Configuration {
     Write-Host "$($Config.GDriveRemote)" -ForegroundColor Yellow
     Write-Host "  Backup Retention: " -NoNewline -ForegroundColor Gray
     Write-Host "Keep last $BACKUP_RETENTION_COUNT backups" -ForegroundColor Yellow
+    if ($Config.ScheduleFrequency -and $Config.ScheduleTime) {
+        Write-Host "  Schedule:         " -NoNewline -ForegroundColor Gray
+        Write-Host "$($Config.ScheduleFrequency) at $($Config.ScheduleTime)" -ForegroundColor Yellow
+    } else {
+        Write-Host "  Schedule:         " -NoNewline -ForegroundColor Gray
+        Write-Host "Not scheduled" -ForegroundColor DarkGray
+    }
     Write-Host ""
     Write-Host ("=" * 80) -ForegroundColor Cyan
     Write-Host ("─" * 80) -ForegroundColor DarkGray
@@ -636,11 +655,25 @@ function New-BackupSchedule {
         }
     }
     
-    # Create principal (run as current user, highest privileges)
-    $principal = New-ScheduledTaskPrincipal `
-        -UserId "$env:USERDOMAIN\$env:USERNAME" `
-        -LogonType Interactive `
-        -RunLevel Highest
+    # Check if running as administrator
+    $isAdmin = Test-IsAdministrator
+    
+    # Create principal (run as current user)
+    # Use highest privileges only if running as administrator
+    if ($isAdmin) {
+        $principal = New-ScheduledTaskPrincipal `
+            -UserId "$env:USERDOMAIN\$env:USERNAME" `
+            -LogonType Interactive `
+            -RunLevel Highest
+    } else {
+        # Without admin rights, we can't use Highest run level
+        # Use Limited run level instead (default)
+        Write-ColorMessage "  Note: Not running as administrator. Task will be created with limited privileges." -Type Warning
+        Write-ColorMessage "  For highest privileges, run PowerShell as Administrator and try again." -Type Info
+        $principal = New-ScheduledTaskPrincipal `
+            -UserId "$env:USERDOMAIN\$env:USERNAME" `
+            -LogonType Interactive
+    }
     
     # Create settings
     $settings = New-ScheduledTaskSettingsSet `
@@ -666,6 +699,9 @@ function New-BackupSchedule {
         Write-ColorMessage "    Task Name: $taskName" -Type Info
         Write-ColorMessage "    Frequency: $Frequency" -Type Info
         Write-ColorMessage "    Time: $Time" -Type Info
+        if (-not $isAdmin) {
+            Write-ColorMessage "    Run Level: Limited (run as Administrator for highest privileges)" -Type Warning
+        }
         
         # Save schedule to registry
         if (-not (Test-Path "HKCU:\Software\WebsiteBackup")) {
@@ -678,6 +714,10 @@ function New-BackupSchedule {
     }
     catch {
         Write-ColorMessage "  ✗ Failed to create scheduled task: $_" -Type Error
+        if ($_.Exception.Message -match "Access is denied" -or $_.Exception.Message -match "denied") {
+            Write-ColorMessage "  This error usually means you need administrator privileges." -Type Warning
+            Write-ColorMessage "  Solution: Right-click PowerShell and select 'Run as Administrator', then try again." -Type Info
+        }
         return $false
     }
 }
@@ -1497,6 +1537,8 @@ function Get-StoredCredentials {
             SSHPort = $script:SSHPort
             RemotePath = $script:RemotePath
             GDriveRemote = $script:GDriveRemote
+            ScheduleFrequency = $null
+            ScheduleTime = $null
         }
         
         # If credentials not provided as parameters, try to load from registry (secure storage)
@@ -1511,6 +1553,19 @@ function Get-StoredCredentials {
                     if ([string]::IsNullOrEmpty($config.SSHHost)) { $config.SSHHost = $regConfig.SSHHost }
                     if ([string]::IsNullOrEmpty($config.RemotePath)) { $config.RemotePath = $regConfig.RemotePath }
                     if ([string]::IsNullOrEmpty($config.GDriveRemote)) { $config.GDriveRemote = $regConfig.GDriveRemote }
+                    # Load schedule information if available
+                    if ($regConfig.ScheduleFrequency) { $config.ScheduleFrequency = $regConfig.ScheduleFrequency }
+                    if ($regConfig.ScheduleTime) { $config.ScheduleTime = $regConfig.ScheduleTime }
+                }
+            }
+        } else {
+            # Even if credentials are provided as parameters, still try to load schedule from registry
+            $regPath = "HKCU:\Software\WebsiteBackup"
+            if (Test-Path $regPath) {
+                $regConfig = Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue
+                if ($regConfig) {
+                    if ($regConfig.ScheduleFrequency) { $config.ScheduleFrequency = $regConfig.ScheduleFrequency }
+                    if ($regConfig.ScheduleTime) { $config.ScheduleTime = $regConfig.ScheduleTime }
                 }
             }
         }
