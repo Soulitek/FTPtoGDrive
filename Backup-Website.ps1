@@ -1907,13 +1907,23 @@ function Test-Prerequisites {
         $allPrereqsMet = $false
     }
     
-    # Check rclone
+    # Check rclone (with timeout to prevent hanging)
     try {
-        $rcloneVersion = rclone version 2>&1 | Select-Object -First 1
-        Write-Log "Rclone found: $rcloneVersion" -Level Success
+        $rcloneJob = Start-Job -ScriptBlock { rclone version 2>&1 | Select-Object -First 1 }
+        $jobResult = Wait-Job -Job $rcloneJob -Timeout 10
+        if ($jobResult) {
+            $rcloneVersion = Receive-Job -Job $rcloneJob
+            Remove-Job -Job $rcloneJob -Force
+            Write-Log "Rclone found: $rcloneVersion" -Level Success
+        }
+        else {
+            Stop-Job -Job $rcloneJob -ErrorAction SilentlyContinue
+            Remove-Job -Job $rcloneJob -Force -ErrorAction SilentlyContinue
+            throw "Rclone check timed out"
+        }
     }
     catch {
-        Write-Log "Rclone not found. Please install rclone and configure Google Drive remote." -Level Error
+        Write-Log "Rclone not found or not responding. Please install rclone and configure Google Drive remote." -Level Error
         $allPrereqsMet = $false
     }
     
