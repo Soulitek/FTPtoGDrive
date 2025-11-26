@@ -51,7 +51,7 @@
     - Rclone installed and configured with Google Drive remote
     - Run Setup-BackupCredentials.ps1 first for initial setup
 
-    Script built with ❤️ by Soulitek
+    Script built with love by Soulitek
     Professional IT Business Solutions
     
     Contact: letstalk@soulitek.co.il
@@ -315,23 +315,23 @@ function Show-WelcomeScreen {
     Write-ColorMessage "Welcome! It looks like this is your first time running this backup." -Type Info
     Write-Host ""
     Write-ColorMessage "I'll guide you through a quick setup process that will configure:" -Type Info
-    Write-ColorMessage "  ✓ SSH connection to your server" -Type Info
-    Write-ColorMessage "  ✓ Website files location" -Type Info
-    Write-ColorMessage "  ✓ Google Drive backup storage" -Type Info
-    Write-ColorMessage "  ✓ Automated backup schedule (optional)" -Type Info
+    Write-ColorMessage "  [OK] SSH connection to your server" -Type Info
+    Write-ColorMessage "  [OK] Website files location" -Type Info
+    Write-ColorMessage "  [OK] Google Drive backup storage" -Type Info
+    Write-ColorMessage "  [OK] Automated backup schedule (optional)" -Type Info
     Write-Host ""
     Write-ColorMessage "Estimated time: 15-20 minutes" -Type Warning
     Write-Host ""
     Write-ColorMessage "Prerequisites that will be checked:" -Type Info
-    Write-ColorMessage "  • OpenSSH Client" -Type Info
-    Write-ColorMessage "  • Rclone (for Google Drive)" -Type Info
-    Write-ColorMessage "  • SSH key pair" -Type Info
+    Write-ColorMessage "  * OpenSSH Client" -Type Info
+    Write-ColorMessage "  * Rclone (for Google Drive)" -Type Info
+    Write-ColorMessage "  * SSH key pair" -Type Info
     Write-Host ""
-    Write-Host ("─" * 80) -ForegroundColor DarkGray
-    Write-Host "  Script built with ❤️ by Soulitek" -ForegroundColor DarkGray
+    Write-Host ("-" * 80) -ForegroundColor DarkGray
+    Write-Host "  Script built with love by Soulitek" -ForegroundColor DarkGray
     Write-Host "  Professional IT Business Solutions" -ForegroundColor DarkGray
     Write-Host "  Contact: letstalk@soulitek.co.il | www.soulitek.co.il" -ForegroundColor DarkGray
-    Write-Host ("─" * 80) -ForegroundColor DarkGray
+    Write-Host ("-" * 80) -ForegroundColor DarkGray
     Write-Host ""
 }
 
@@ -368,11 +368,155 @@ function Show-Configuration {
     }
     Write-Host ""
     Write-Host ("=" * 80) -ForegroundColor Cyan
-    Write-Host ("─" * 80) -ForegroundColor DarkGray
-    Write-Host "  Script built with ❤️ by Soulitek - Professional IT Business Solutions" -ForegroundColor DarkGray
+    Write-Host ("-" * 80) -ForegroundColor DarkGray
+    Write-Host "  Script built with love by Soulitek - Professional IT Business Solutions" -ForegroundColor DarkGray
     Write-Host "  Contact: letstalk@soulitek.co.il | www.soulitek.co.il" -ForegroundColor DarkGray
-    Write-Host ("─" * 80) -ForegroundColor DarkGray
+    Write-Host ("-" * 80) -ForegroundColor DarkGray
     Write-Host ""
+}
+
+function Install-OpenSSHClient {
+    <#
+    .SYNOPSIS
+        Automatically installs OpenSSH Client on Windows.
+    #>
+    [CmdletBinding()]
+    param()
+    
+    Write-Host ""
+    Write-ColorMessage "  Attempting to install OpenSSH Client..." -Type Info
+    
+    # Check if running as administrator
+    if (-not (Test-IsAdministrator)) {
+        Write-ColorMessage "  [!] Administrator privileges required to install OpenSSH Client." -Type Warning
+        Write-ColorMessage "  Please run PowerShell as Administrator and try again." -Type Warning
+        Write-ColorMessage "  Or install manually: Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0" -Type Info
+        return $false
+    }
+    
+    try {
+        Write-ColorMessage "  Installing OpenSSH Client via Windows Features..." -Type Info
+        
+        # Check if already installed (capability might exist but not be detected by Get-Command)
+        $capability = Get-WindowsCapability -Online | Where-Object { $_.Name -like "OpenSSH.Client*" }
+        
+        if ($capability.State -eq "Installed") {
+            Write-ColorMessage "  [OK] OpenSSH Client is already installed!" -Type Success
+            Write-ColorMessage "  Note: You may need to restart your terminal for it to be detected." -Type Warning
+            return $true
+        }
+        
+        # Install OpenSSH Client
+        $result = Add-WindowsCapability -Online -Name "OpenSSH.Client~~~~0.0.1.0" -ErrorAction Stop
+        
+        if ($result.RestartNeeded) {
+            Write-ColorMessage "  [OK] OpenSSH Client installed! A restart may be required." -Type Success
+        } else {
+            Write-ColorMessage "  [OK] OpenSSH Client installed successfully!" -Type Success
+        }
+        
+        # Refresh environment PATH
+        $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+        
+        return $true
+    }
+    catch {
+        Write-ColorMessage "  [X] Failed to install OpenSSH Client: $_" -Type Error
+        Write-ColorMessage "  Manual installation: Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0" -Type Info
+        return $false
+    }
+}
+
+function Install-Rclone {
+    <#
+    .SYNOPSIS
+        Automatically downloads and installs Rclone.
+    #>
+    [CmdletBinding()]
+    param()
+    
+    Write-Host ""
+    Write-ColorMessage "  Attempting to install Rclone..." -Type Info
+    
+    $rcloneDir = Join-Path $env:LOCALAPPDATA "rclone"
+    $rcloneExe = Join-Path $rcloneDir "rclone.exe"
+    $downloadUrl = "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
+    $tempZip = Join-Path $env:TEMP "rclone-install.zip"
+    $tempExtract = Join-Path $env:TEMP "rclone-extract"
+    
+    try {
+        # Create rclone directory
+        if (-not (Test-Path $rcloneDir)) {
+            New-Item -Path $rcloneDir -ItemType Directory -Force | Out-Null
+            Write-ColorMessage "  Created directory: $rcloneDir" -Type Info
+        }
+        
+        # Download rclone
+        Write-ColorMessage "  Downloading Rclone from $downloadUrl..." -Type Info
+        Write-ColorMessage "  This may take a moment..." -Type Info
+        
+        # Use TLS 1.2 for secure download
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        
+        # Download with progress
+        $webClient = New-Object System.Net.WebClient
+        $webClient.DownloadFile($downloadUrl, $tempZip)
+        
+        Write-ColorMessage "  Download complete. Extracting..." -Type Info
+        
+        # Clean up old extraction folder if exists
+        if (Test-Path $tempExtract) {
+            Remove-Item -Path $tempExtract -Recurse -Force
+        }
+        
+        # Extract the zip
+        Expand-Archive -Path $tempZip -DestinationPath $tempExtract -Force
+        
+        # Find the rclone.exe in the extracted folder
+        $extractedExe = Get-ChildItem -Path $tempExtract -Recurse -Filter "rclone.exe" | Select-Object -First 1
+        
+        if (-not $extractedExe) {
+            throw "rclone.exe not found in downloaded archive"
+        }
+        
+        # Copy rclone.exe to install directory
+        Copy-Item -Path $extractedExe.FullName -Destination $rcloneExe -Force
+        
+        Write-ColorMessage "  Rclone installed to: $rcloneDir" -Type Success
+        
+        # Add to user PATH if not already there
+        $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+        if ($userPath -notlike "*$rcloneDir*") {
+            Write-ColorMessage "  Adding Rclone to user PATH..." -Type Info
+            $newPath = "$userPath;$rcloneDir"
+            [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
+            
+            # Update current session PATH
+            $env:Path = "$env:Path;$rcloneDir"
+            
+            Write-ColorMessage "  [OK] Rclone added to PATH" -Type Success
+        }
+        
+        # Clean up temp files
+        Remove-Item -Path $tempZip -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path $tempExtract -Recurse -Force -ErrorAction SilentlyContinue
+        
+        # Verify installation
+        $version = & $rcloneExe version 2>&1 | Select-Object -First 1
+        Write-ColorMessage "  [OK] Rclone installed successfully: $version" -Type Success
+        
+        return $true
+    }
+    catch {
+        Write-ColorMessage "  [X] Failed to install Rclone: $_" -Type Error
+        Write-ColorMessage "  Manual installation: Download from https://rclone.org/downloads/" -Type Info
+        
+        # Clean up on failure
+        Remove-Item -Path $tempZip -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path $tempExtract -Recurse -Force -ErrorAction SilentlyContinue
+        
+        return $false
+    }
 }
 
 function Test-Prerequisite {
@@ -396,11 +540,11 @@ function Test-Prerequisite {
     
     try {
         $null = & $Command 2>&1
-        Write-ColorMessage "✓ Found" -Type Success
+        Write-ColorMessage "[OK] Found" -Type Success
         return $true
     }
     catch {
-        Write-ColorMessage "✗ Not Found" -Type Error
+        Write-ColorMessage "[X] Not Found" -Type Error
         
         if ($InstallGuide) {
             Write-Host ""
@@ -450,16 +594,16 @@ function New-SSHKeyPair {
             -Wait -NoNewWindow -PassThru
         
         if ($process.ExitCode -eq 0) {
-            Write-ColorMessage "✓ SSH key pair generated successfully!" -Type Success
+            Write-ColorMessage "[OK] SSH key pair generated successfully!" -Type Success
             return $true
         }
         else {
-            Write-ColorMessage "✗ Failed to generate SSH key pair." -Type Error
+            Write-ColorMessage "[X] Failed to generate SSH key pair." -Type Error
             return $false
         }
     }
     catch {
-        Write-ColorMessage "✗ Error generating SSH key: $_" -Type Error
+        Write-ColorMessage "[X] Error generating SSH key: $_" -Type Error
         return $false
     }
 }
@@ -695,7 +839,7 @@ function New-BackupSchedule {
             -Description "Automated website backup - Runs $Frequency at $Time" `
             -ErrorAction Stop | Out-Null
         
-        Write-ColorMessage "  ✓ Scheduled task created successfully!" -Type Success
+        Write-ColorMessage "  [OK] Scheduled task created successfully!" -Type Success
         Write-ColorMessage "    Task Name: $taskName" -Type Info
         Write-ColorMessage "    Frequency: $Frequency" -Type Info
         Write-ColorMessage "    Time: $Time" -Type Info
@@ -713,7 +857,7 @@ function New-BackupSchedule {
         return $true
     }
     catch {
-        Write-ColorMessage "  ✗ Failed to create scheduled task: $_" -Type Error
+        Write-ColorMessage "  [X] Failed to create scheduled task: $_" -Type Error
         if ($_.Exception.Message -match "Access is denied" -or $_.Exception.Message -match "denied") {
             Write-ColorMessage "  This error usually means you need administrator privileges." -Type Warning
             Write-ColorMessage "  Solution: Right-click PowerShell and select 'Run as Administrator', then try again." -Type Info
@@ -735,7 +879,7 @@ function Remove-BackupSchedule {
     try {
         $task = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false | Out-Null
-        Write-ColorMessage "✓ Scheduled task removed successfully!" -Type Success
+        Write-ColorMessage "[OK] Scheduled task removed successfully!" -Type Success
         
         # Remove from registry
         if (Test-Path "HKCU:\Software\WebsiteBackup") {
@@ -765,9 +909,9 @@ function Clear-BackupConfiguration {
     Write-Host ("=" * 80) -ForegroundColor Red
     Write-Host ""
     Write-ColorMessage "This will permanently delete:" -Type Warning
-    Write-Host "  • All backup configuration (SSH, paths, Google Drive settings)" -ForegroundColor Yellow
-    Write-Host "  • Scheduled backup tasks" -ForegroundColor Yellow
-    Write-Host "  • All stored credentials and settings" -ForegroundColor Yellow
+    Write-Host "  * All backup configuration (SSH, paths, Google Drive settings)" -ForegroundColor Yellow
+    Write-Host "  * Scheduled backup tasks" -ForegroundColor Yellow
+    Write-Host "  * All stored credentials and settings" -ForegroundColor Yellow
     Write-Host ""
     Write-ColorMessage "This action CANNOT be undone!" -Type Error
     Write-Host ""
@@ -823,21 +967,21 @@ function Clear-BackupConfiguration {
     # Show results
     Write-Host ""
     if ($deleted.Count -gt 0) {
-        Write-ColorMessage "✓ Successfully deleted:" -Type Success
+        Write-ColorMessage "[OK] Successfully deleted:" -Type Success
         foreach ($item in $deleted) {
-            Write-Host "  • $item" -ForegroundColor Green
+            Write-Host "  * $item" -ForegroundColor Green
         }
     }
     
     if ($errors.Count -gt 0) {
-        Write-ColorMessage "⚠ Errors encountered:" -Type Warning
-        foreach ($error in $errors) {
-            Write-Host "  • $error" -ForegroundColor Yellow
+        Write-ColorMessage "[!] Errors encountered:" -Type Warning
+        foreach ($errMsg in $errors) {
+            Write-Host "  * $errMsg" -ForegroundColor Yellow
         }
     }
     
     Write-Host ""
-    Write-ColorMessage "✓ All configuration has been cleared!" -Type Success
+    Write-ColorMessage "[OK] All configuration has been cleared!" -Type Success
     Write-Host ""
     Write-ColorMessage "You can now run the setup wizard again by running:" -Type Info
     Write-Host "  .\Backup-Website.ps1" -ForegroundColor Yellow
@@ -978,7 +1122,7 @@ function Show-ScheduleMenu {
                 
                 if (New-BackupSchedule -Frequency $scheduleFrequency -Time $scheduleTime) {
                     Write-Host ""
-                    Write-ColorMessage "✓ Schedule updated successfully!" -Type Success
+                    Write-ColorMessage "[OK] Schedule updated successfully!" -Type Success
                 }
             }
         }
@@ -994,10 +1138,10 @@ function Show-ScheduleMenu {
             Write-ColorMessage "Testing scheduled task (running backup now)..." -Type Info
             try {
                 Start-ScheduledTask -TaskName "Website Backup - Automated" -ErrorAction Stop
-                Write-ColorMessage "✓ Task started! Check Task Scheduler or logs for results." -Type Success
+                Write-ColorMessage "[OK] Task started! Check Task Scheduler or logs for results." -Type Success
             }
             catch {
-                Write-ColorMessage "✗ Failed to start task: $_" -Type Error
+                Write-ColorMessage "[X] Failed to start task: $_" -Type Error
             }
         }
     }
@@ -1032,7 +1176,62 @@ function Invoke-InteractiveSetup {
     $rcloneInstalled = Test-Prerequisite -ToolName "Rclone" -Command "rclone" `
         -InstallGuide "Download from: https://rclone.org/downloads/ and add to PATH"
     
+    # Offer automatic installation for missing prerequisites
+    if (-not $sshInstalled) {
+        Write-Host ""
+        $installSSH = Read-UserChoice -Prompt "Would you like to automatically install OpenSSH Client?" -ValidChoices @('Y', 'N') -DefaultChoice 'Y'
+        if ($installSSH -eq 'Y') {
+            $sshInstalled = Install-OpenSSHClient
+            if ($sshInstalled) {
+                Write-Host ""
+                Write-ColorMessage "  Verifying OpenSSH installation..." -Type Info
+                Start-Sleep -Seconds 2
+                # Re-test the command
+                try {
+                    $null = & ssh 2>&1
+                    $sshInstalled = $true
+                    Write-ColorMessage "  [OK] OpenSSH Client is now available!" -Type Success
+                }
+                catch {
+                    Write-ColorMessage "  [!] OpenSSH installed but may require terminal restart to be detected." -Type Warning
+                    $sshInstalled = $true  # Assume it's installed even if not detected yet
+                }
+            }
+        }
+    }
+    
+    if (-not $rcloneInstalled) {
+        Write-Host ""
+        $installRclone = Read-UserChoice -Prompt "Would you like to automatically install Rclone?" -ValidChoices @('Y', 'N') -DefaultChoice 'Y'
+        if ($installRclone -eq 'Y') {
+            $rcloneInstalled = Install-Rclone
+            if ($rcloneInstalled) {
+                Write-Host ""
+                Write-ColorMessage "  Verifying Rclone installation..." -Type Info
+                Start-Sleep -Seconds 1
+                # Re-test the command
+                try {
+                    $null = & rclone version 2>&1
+                    $rcloneInstalled = $true
+                    Write-ColorMessage "  [OK] Rclone is now available!" -Type Success
+                }
+                catch {
+                    # Try with full path
+                    $rcloneExe = Join-Path $env:LOCALAPPDATA "rclone\rclone.exe"
+                    if (Test-Path $rcloneExe) {
+                        Write-ColorMessage "  [OK] Rclone installed. You may need to restart terminal for PATH to update." -Type Success
+                        $rcloneInstalled = $true
+                    }
+                }
+            }
+        }
+    }
+    
     if (-not $sshInstalled -or -not $rcloneInstalled) {
+        Write-Host ""
+        Write-ColorMessage "Missing prerequisites:" -Type Error
+        if (-not $sshInstalled) { Write-ColorMessage "  - OpenSSH Client" -Type Error }
+        if (-not $rcloneInstalled) { Write-ColorMessage "  - Rclone" -Type Error }
         Write-Host ""
         Write-ColorMessage "Please install the missing prerequisites and run this script again." -Type Error
         $retry = Read-UserChoice -Prompt "Would you like to retry the prerequisite check?" -ValidChoices @('Y', 'N') -DefaultChoice 'N'
@@ -1042,14 +1241,14 @@ function Invoke-InteractiveSetup {
         return $null
     }
     
-    Write-ColorMessage "`n✓ All prerequisites are installed!" -Type Success
+    Write-ColorMessage "`n[OK] All prerequisites are installed!" -Type Success
     Start-Sleep -Seconds 2
     
     # STEP 2: SSH Key Setup
     Show-ProgressStep -Step 2 -TotalSteps 8 -Description "SSH Key Setup"
     
     if (Test-SSHKeyExists) {
-        Write-ColorMessage "✓ SSH key pair already exists." -Type Success
+        Write-ColorMessage "[OK] SSH key pair already exists." -Type Success
     }
     else {
         Write-ColorMessage "No SSH key pair found. Let's create one." -Type Warning
@@ -1099,10 +1298,10 @@ function Invoke-InteractiveSetup {
     Write-ColorMessage "Testing SSH connection..." -Type Info
     
     if (Test-SSHConnectionQuiet -User $sshUser -Hostname $sshHost -Port $sshPort) {
-        Write-ColorMessage "✓ SSH connection successful!" -Type Success
+        Write-ColorMessage "[OK] SSH connection successful!" -Type Success
     }
     else {
-        Write-ColorMessage "✗ SSH connection failed!" -Type Error
+        Write-ColorMessage "[X] SSH connection failed!" -Type Error
         Write-ColorMessage "Please check your SSH key, server details, and network connection." -Type Warning
         
         $retry = Read-UserChoice -Prompt "Would you like to try different connection details?" -ValidChoices @('Y', 'N') -DefaultChoice 'Y'
@@ -1186,10 +1385,10 @@ function Invoke-InteractiveSetup {
     Write-Host ""
     Write-ColorMessage "Verifying path: $remotePath" -Type Info
     if (Test-RemotePathExists -User $sshUser -Hostname $sshHost -Port $sshPort -Path $remotePath) {
-        Write-ColorMessage "✓ Path exists and is accessible!" -Type Success
+        Write-ColorMessage "[OK] Path exists and is accessible!" -Type Success
     }
     else {
-        Write-ColorMessage "✗ Warning: Path may not exist or is not accessible." -Type Warning
+        Write-ColorMessage "[X] Warning: Path may not exist or is not accessible." -Type Warning
         $continue = Read-UserChoice -Prompt "Continue anyway?" -ValidChoices @('Y', 'N') -DefaultChoice 'N'
         if ($continue -ne 'Y') {
             return $null
@@ -1216,7 +1415,7 @@ function Invoke-InteractiveSetup {
     $gdriveExists = $remotes -contains "gdrive:"
     
     if ($gdriveExists) {
-        Write-ColorMessage "✓ Google Drive remote 'gdrive' already configured!" -Type Success
+        Write-ColorMessage "[OK] Google Drive remote 'gdrive' already configured!" -Type Success
     }
     else {
         Write-Host ""
@@ -1255,11 +1454,11 @@ function Invoke-InteractiveSetup {
         $gdriveExists = $remotes -contains "gdrive:"
         
         if (-not $gdriveExists) {
-            Write-ColorMessage "✗ Google Drive remote 'gdrive' was not found. Please run rclone config manually." -Type Error
+            Write-ColorMessage "[X] Google Drive remote 'gdrive' was not found. Please run rclone config manually." -Type Error
             return $null
         }
         
-        Write-ColorMessage "✓ Google Drive configured successfully!" -Type Success
+        Write-ColorMessage "[OK] Google Drive configured successfully!" -Type Success
     }
     
     # Create backup directories
@@ -1269,7 +1468,7 @@ function Invoke-InteractiveSetup {
     $null = Start-Process -FilePath "rclone" -ArgumentList "mkdir", "gdrive:backups" -Wait -NoNewWindow -PassThru
     $null = Start-Process -FilePath "rclone" -ArgumentList "mkdir", "gdrive:backups/website" -Wait -NoNewWindow -PassThru
     
-    Write-ColorMessage "✓ Backup directories created!" -Type Success
+    Write-ColorMessage "[OK] Backup directories created!" -Type Success
     
     $gdriveRemote = "gdrive:backups/website"
     
@@ -1313,12 +1512,12 @@ function Invoke-InteractiveSetup {
         
         if (New-BackupSchedule -Frequency $scheduleFrequency -Time $scheduleTime) {
             Write-Host ""
-            Write-ColorMessage "🎉 Automatic backups scheduled!" -Type Success
+            Write-ColorMessage "*** Automatic backups scheduled!" -Type Success
             Write-ColorMessage "   Your backups will run $scheduleFrequency at $scheduleTime" -Type Info
             Write-Host ""
         }
         else {
-            Write-ColorMessage "⚠ Scheduling failed. You can schedule later or run backups manually." -Type Warning
+            Write-ColorMessage "[!] Scheduling failed. You can schedule later or run backups manually." -Type Warning
         }
     }
     else {
@@ -1371,10 +1570,10 @@ function Invoke-InteractiveSetup {
         Set-ItemProperty -Path "HKCU:\Software\WebsiteBackup" -Name "RemotePath" -Value $remotePath
         Set-ItemProperty -Path "HKCU:\Software\WebsiteBackup" -Name "GDriveRemote" -Value $gdriveRemote
         
-        Write-ColorMessage "✓ Configuration saved successfully!" -Type Success
+        Write-ColorMessage "[OK] Configuration saved successfully!" -Type Success
     }
     catch {
-        Write-ColorMessage "✗ Failed to save configuration: $_" -Type Error
+        Write-ColorMessage "[X] Failed to save configuration: $_" -Type Error
         return $null
     }
     
@@ -1384,14 +1583,14 @@ function Invoke-InteractiveSetup {
     Show-ProgressStep -Step 8 -TotalSteps 8 -Description "Setup Complete!"
     
     Write-Host ""
-    Write-ColorMessage "🎉 Setup completed successfully!" -Type Success
+    Write-ColorMessage "*** Setup completed successfully!" -Type Success
     Write-Host ""
     Write-ColorMessage "Your backup system is now configured and ready to use." -Type Info
     Write-Host ""
-    Write-Host ("─" * 80) -ForegroundColor DarkGray
-    Write-Host "  Script built with ❤️ by Soulitek - Professional IT Business Solutions" -ForegroundColor DarkGray
+    Write-Host ("-" * 80) -ForegroundColor DarkGray
+    Write-Host "  Script built with love by Soulitek - Professional IT Business Solutions" -ForegroundColor DarkGray
     Write-Host "  Contact: letstalk@soulitek.co.il | www.soulitek.co.il" -ForegroundColor DarkGray
-    Write-Host ("─" * 80) -ForegroundColor DarkGray
+    Write-Host ("-" * 80) -ForegroundColor DarkGray
     Write-Host ""
     
     $runNow = Read-UserChoice -Prompt "Would you like to run your first backup now?" -ValidChoices @('Y', 'N') -DefaultChoice 'Y'
@@ -2271,7 +2470,7 @@ Please check the log file for error details.
         Write-Log "========================================" -Level Info
         Write-Log "Log file saved to: $LOG_FILE" -Level Info
         Write-Log "========================================" -Level Info
-        Write-Log "Script built with ❤️ by Soulitek - Professional IT Business Solutions" -Level Info
+        Write-Log "Script built with love by Soulitek - Professional IT Business Solutions" -Level Info
         Write-Log "Contact: letstalk@soulitek.co.il | www.soulitek.co.il" -Level Info
     }
     
