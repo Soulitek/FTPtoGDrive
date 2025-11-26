@@ -538,12 +538,32 @@ function Test-Prerequisite {
     
     Write-Host "  Checking for $ToolName... " -NoNewline
     
-    try {
-        $null = & $Command 2>&1
+    # Use Get-Command which is more reliable than trying to execute the command
+    $cmdInfo = Get-Command $Command -ErrorAction SilentlyContinue
+    
+    if ($cmdInfo) {
         Write-ColorMessage "[OK] Found" -Type Success
         return $true
     }
-    catch {
+    else {
+        # Also check Windows Capability for OpenSSH
+        if ($Command -eq "ssh") {
+            $capability = Get-WindowsCapability -Online -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "OpenSSH.Client*" -and $_.State -eq "Installed" }
+            if ($capability) {
+                Write-ColorMessage "[OK] Found (may need terminal restart)" -Type Success
+                return $true
+            }
+        }
+        
+        # Check common install locations for rclone
+        if ($Command -eq "rclone") {
+            $rclonePath = Join-Path $env:LOCALAPPDATA "rclone\rclone.exe"
+            if (Test-Path $rclonePath) {
+                Write-ColorMessage "[OK] Found" -Type Success
+                return $true
+            }
+        }
+        
         Write-ColorMessage "[X] Not Found" -Type Error
         
         if ($InstallGuide) {
@@ -1323,20 +1343,51 @@ function Invoke-InteractiveSetup {
     Write-Host "  - /home/username/applications/myapp/public_html" -ForegroundColor Yellow
     Write-Host "  - /var/www/html" -ForegroundColor Yellow
     Write-Host ""
+    Write-ColorMessage "TIP: You can use wildcards (*) to backup multiple folders at once!" -Type Info
+    Write-ColorMessage "Example: /home/username/applications/*/local_backups" -Type Info
+    Write-ColorMessage "         This will backup ALL local_backups folders from ALL applications." -Type Info
+    Write-Host ""
     
     $remotePath = Read-UserInput -Prompt "Enter the full path to your website files" -Required
     
+    # Check if path contains wildcard
+    $hasWildcard = $remotePath -match '\*'
+    
     # Verify the path exists
     Write-Host ""
-    Write-ColorMessage "Verifying path: $remotePath" -Type Info
-    if (Test-RemotePathExists -User $sshUser -Hostname $sshHost -Port $sshPort -Path $remotePath) {
-        Write-ColorMessage "[OK] Path exists and is accessible!" -Type Success
+    if ($hasWildcard) {
+        Write-ColorMessage "Wildcard path detected: $remotePath" -Type Info
+        Write-ColorMessage "Verifying wildcard pattern expands to valid directories..." -Type Info
+        
+        # Test if the wildcard pattern matches any directories
+        $testWildcardCmd = "ssh -p $sshPort ${sshUser}@${sshHost} 'ls -d $remotePath 2>/dev/null | head -5'"
+        $wildcardResult = Invoke-Expression $testWildcardCmd 2>&1
+        
+        if ($LASTEXITCODE -eq 0 -and $wildcardResult) {
+            $matchCount = ($wildcardResult | Measure-Object -Line).Lines
+            Write-ColorMessage "[OK] Pattern matches at least $matchCount directories!" -Type Success
+            Write-ColorMessage "Sample matches:" -Type Info
+            $wildcardResult | Select-Object -First 5 | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow }
+        }
+        else {
+            Write-ColorMessage "[X] Warning: Wildcard pattern doesn't match any directories." -Type Warning
+            $continue = Read-UserChoice -Prompt "Continue anyway?" -ValidChoices @('Y', 'N') -DefaultChoice 'N'
+            if ($continue -ne 'Y') {
+                return $null
+            }
+        }
     }
     else {
-        Write-ColorMessage "[X] Warning: Path may not exist or is not accessible." -Type Warning
-        $continue = Read-UserChoice -Prompt "Continue anyway?" -ValidChoices @('Y', 'N') -DefaultChoice 'N'
-        if ($continue -ne 'Y') {
-            return $null
+        Write-ColorMessage "Verifying path: $remotePath" -Type Info
+        if (Test-RemotePathExists -User $sshUser -Hostname $sshHost -Port $sshPort -Path $remotePath) {
+            Write-ColorMessage "[OK] Path exists and is accessible!" -Type Success
+        }
+        else {
+            Write-ColorMessage "[X] Warning: Path may not exist or is not accessible." -Type Warning
+            $continue = Read-UserChoice -Prompt "Continue anyway?" -ValidChoices @('Y', 'N') -DefaultChoice 'N'
+            if ($continue -ne 'Y') {
+                return $null
+            }
         }
     }
     
@@ -1842,6 +1893,7 @@ function New-BackupArchive {
     <#
     .SYNOPSIS
         Creates a compressed tar.gz archive on the remote server.
+        Supports both single paths and wildcard patterns (e.g., /path/to/*/local_backups)
     #>
     [CmdletBinding()]
     param(
@@ -1857,7 +1909,16 @@ function New-BackupArchive {
         Write-Log "Creating/updating backup archive: backup.tgz" -Level Info
         Write-Log "Source path: $($Config.RemotePath)" -Level Info
         Write-Log "Remote backup path: $REMOTE_BACKUP_PATH" -Level Info
-        Write-Log "Note: backup.tgz will be excluded from the archive to avoid recursion" -Level Info
+        
+        # Check if path contains wildcard
+        $hasWildcard = $Config.RemotePath -match '\*'
+        
+        if ($hasWildcard) {
+            Write-Log "Wildcard pattern detected - will backup all matching directories" -Level Info
+        }
+        else {
+            Write-Log "Note: backup.tgz will be excluded from the archive to avoid recursion" -Level Info
+        }
         
         if ($DryRun) {
             Write-Log "[DRY RUN] Would create remote archive" -Level Warning
@@ -1870,7 +1931,17 @@ function New-BackupArchive {
         $tempBackupPath = "/tmp/$BACKUP_NAME"
         
         Write-Log "Creating temporary backup in /tmp first..." -Level Info
-        $tarCommand = "cd '$($Config.RemotePath)' && tar -czf '$tempBackupPath' --exclude='$backupFileName' ."
+        
+        if ($hasWildcard) {
+            # For wildcard paths, use tar with the glob pattern directly
+            # The shell will expand the wildcard to all matching directories
+            $tarCommand = "tar -czf '$tempBackupPath' --ignore-failed-read $($Config.RemotePath) 2>/dev/null"
+        }
+        else {
+            # For single path, cd into directory and tar current dir (excluding backup file)
+            $tarCommand = "cd '$($Config.RemotePath)' && tar -czf '$tempBackupPath' --exclude='$backupFileName' ."
+        }
+        
         $sshCommand = "ssh -p $($Config.SSHPort) $($Config.SSHUser)@$($Config.SSHHost) `"$tarCommand`""
         
         Write-Log "Executing: $sshCommand" -Level Info
@@ -2317,18 +2388,31 @@ function Invoke-Backup {
         # Load configuration
         $config = Get-StoredCredentials
         
-        # Set remote backup path to use existing backup.tgz file in local_backups directory
-        # Always store backup.tgz in local_backups, regardless of what directory is being backed up
-        # Calculate local_backups path: if RemotePath ends with /local_backups, use it; otherwise use parent/local_backups
-        if ($config.RemotePath -match '/local_backups/?$') {
-            $localBackupsPath = $config.RemotePath -replace '/local_backups/?$', '/local_backups'
-        } else {
-            # Get parent directory and append local_backups
-            $parentPath = $config.RemotePath -replace '/[^/]+/?$', ''
-            $localBackupsPath = "$parentPath/local_backups"
+        # Set remote backup path to use existing backup.tgz file
+        # Check if path contains wildcard pattern
+        $hasWildcard = $config.RemotePath -match '\*'
+        
+        if ($hasWildcard) {
+            # For wildcard paths, store backup in user's home directory
+            # Extract base path before the wildcard (e.g., /home/user/applications from /home/user/applications/*/local_backups)
+            $basePath = $config.RemotePath -replace '/\*.*$', ''
+            $script:REMOTE_BACKUP_PATH = "$basePath/backup.tgz"
+            Write-Log "Wildcard pattern detected: $($config.RemotePath)" -Level Info
+            Write-Log "Backing up ALL matching directories" -Level Info
         }
-        $script:REMOTE_BACKUP_PATH = "$localBackupsPath/backup.tgz"
-        Write-Log "Backing up directory: $($config.RemotePath)" -Level Info
+        else {
+            # For single path, store in local_backups directory
+            # Calculate local_backups path: if RemotePath ends with /local_backups, use it; otherwise use parent/local_backups
+            if ($config.RemotePath -match '/local_backups/?$') {
+                $localBackupsPath = $config.RemotePath -replace '/local_backups/?$', '/local_backups'
+            } else {
+                # Get parent directory and append local_backups
+                $parentPath = $config.RemotePath -replace '/[^/]+/?$', ''
+                $localBackupsPath = "$parentPath/local_backups"
+            }
+            $script:REMOTE_BACKUP_PATH = "$localBackupsPath/backup.tgz"
+            Write-Log "Backing up directory: $($config.RemotePath)" -Level Info
+        }
         Write-Log "Backup file location: $script:REMOTE_BACKUP_PATH" -Level Info
         
         # Test SSH connection
