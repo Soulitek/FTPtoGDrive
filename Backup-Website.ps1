@@ -123,9 +123,8 @@ $BACKUP_NAME = "website-$BACKUP_TIMESTAMP.tar.gz"
 # Log file path
 $LOG_FILE = Join-Path $LOG_DIR "backup-$(Get-Date -Format 'yyyyMMdd').log"
 
-# Remote backup path - using existing backup file in local_backups directory
-# Note: This will be set dynamically based on RemotePath configuration
-$REMOTE_BACKUP_PATH = ""
+# Note: Backup is streamed directly from remote server to local machine via SSH
+# No archive is created on the remote server to save disk space
 
 # =============================================================================
 # INTERACTIVE SETUP HELPER FUNCTIONS
@@ -1925,141 +1924,11 @@ function Test-Prerequisites {
 # BACKUP FUNCTIONS
 # =============================================================================
 
-function New-BackupArchive {
-    <#
-    .SYNOPSIS
-        Creates a compressed tar.gz archive on the remote server.
-        Supports both single paths and wildcard patterns (e.g., /path/to/*/local_backups)
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory=$true)]
-        [hashtable]$Config
-    )
-    
-    Write-StepHeader "Creating Backup Archive on Remote Server"
-    
-    $stepStart = Get-Date
-    
-    try {
-        Write-Log "Creating/updating backup archive: backup.tgz" -Level Info
-        Write-Log "Source path: $($Config.RemotePath)" -Level Info
-        Write-Log "Remote backup path: $REMOTE_BACKUP_PATH" -Level Info
-        
-        # Check if path contains wildcard
-        $hasWildcard = $Config.RemotePath -match '\*'
-        
-        if ($hasWildcard) {
-            Write-Log "Wildcard pattern detected - will backup all matching directories" -Level Info
-        }
-        else {
-            Write-Log "Note: backup.tgz will be excluded from the archive to avoid recursion" -Level Info
-        }
-        
-        if ($DryRun) {
-            Write-Log "[DRY RUN] Would create remote archive" -Level Warning
-            return $true
-        }
-        
-        # Create tar.gz archive on remote server
-        # Create backup in /tmp first, then move to final location to avoid issues with creating file in same directory
-        $backupFileName = Split-Path -Leaf $REMOTE_BACKUP_PATH
-        $tempBackupPath = "/tmp/$BACKUP_NAME"
-        
-        Write-Log "Creating temporary backup in /tmp first..." -Level Info
-        
-        if ($hasWildcard) {
-            # For wildcard paths, use tar with the glob pattern directly
-            # The shell will expand the wildcard to all matching directories
-            # Using -v for verbose output to show files being added
-            $tarCommand = "tar -cvzf '$tempBackupPath' --ignore-failed-read $($Config.RemotePath) 2>&1"
-        }
-        else {
-            # For single path, cd into directory and tar current dir (excluding backup file)
-            # Using -v for verbose output to show files being added
-            $tarCommand = "cd '$($Config.RemotePath)' && tar -cvzf '$tempBackupPath' --exclude='$backupFileName' . 2>&1"
-        }
-        
-        $sshCommand = "ssh -p $($Config.SSHPort) $($Config.SSHUser)@$($Config.SSHHost) `"$tarCommand`""
-        
-        Write-Log "Executing: $sshCommand" -Level Info
-        Write-Log "Tar verbose output:" -Level Info
-        
-        $result = Invoke-Expression $sshCommand 2>&1
-        
-        # Log the verbose output from tar
-        if ($result) {
-            $lines = $result -split "`n"
-            $fileCount = 0
-            foreach ($line in $lines) {
-                $line = $line.Trim()
-                if ($line) {
-                    Write-Log "  $line" -Level Info
-                    $fileCount++
-                }
-            }
-            Write-Log "Total files/directories processed: $fileCount" -Level Info
-        }
-        
-        if ($LASTEXITCODE -ne 0) {
-            throw "Failed to create remote archive. Exit code: $LASTEXITCODE, Output: $result"
-        }
-        
-        # Move the backup from /tmp to final location
-        Write-Log "Moving backup from /tmp to final location: $REMOTE_BACKUP_PATH" -Level Info
-        $moveCommand = "ssh -p $($Config.SSHPort) $($Config.SSHUser)@$($Config.SSHHost) `"mv '$tempBackupPath' '$REMOTE_BACKUP_PATH'`""
-        $moveResult = Invoke-Expression $moveCommand 2>&1
-        
-        if ($LASTEXITCODE -ne 0) {
-            throw "Failed to move backup to final location. Exit code: $LASTEXITCODE, Output: $moveResult"
-        }
-        
-        Write-Log "Backup moved successfully to final location" -Level Success
-        
-        # Verify the file actually exists and is readable after move
-        Write-Log "Verifying moved file exists and is accessible..." -Level Info
-        $verifyMoveCommand = "ssh -p $($Config.SSHPort) $($Config.SSHUser)@$($Config.SSHHost) 'test -f $REMOTE_BACKUP_PATH && test -r $REMOTE_BACKUP_PATH && echo VERIFIED || echo FAILED'"
-        $verifyMoveResult = Invoke-Expression $verifyMoveCommand 2>&1
-        
-        if ($LASTEXITCODE -ne 0 -or $verifyMoveResult -notmatch "VERIFIED") {
-            throw "File verification failed after move. File may not exist or is not readable. Output: $verifyMoveResult"
-        }
-        
-        # Get archive size using du command (more reliable, avoids awk $5 variable issue)
-        $sizeCommand = "ssh -p $($Config.SSHPort) $($Config.SSHUser)@$($Config.SSHHost) 'du -h $REMOTE_BACKUP_PATH | cut -f1'"
-        $archiveSize = Invoke-Expression $sizeCommand 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            $archiveSize = "Size check failed"
-        }
-        
-        # Check if archive size is suspiciously small (less than 1MB)
-        $sizeBytesCommand = "ssh -p $($Config.SSHPort) $($Config.SSHUser)@$($Config.SSHHost) 'stat -c%s $REMOTE_BACKUP_PATH 2>/dev/null || echo 0'"
-        $sizeBytes = Invoke-Expression $sizeBytesCommand 2>&1
-        if ($LASTEXITCODE -eq 0 -and $sizeBytes -match '^\d+$') {
-            $sizeBytesInt = [long]$sizeBytes
-            if ($sizeBytesInt -lt 1048576) {  # Less than 1MB
-                Write-Log "Warning: Archive size is suspiciously small ($archiveSize / $sizeBytesInt bytes). Archive may be empty or corrupted." -Level Warning
-            }
-        }
-        
-        $duration = (Get-Date) - $stepStart
-        Write-Log "Archive created successfully" -Level Success
-        Write-Log "Archive size: $archiveSize" -Level Info
-        Write-Log "Duration: $($duration.TotalSeconds.ToString('F2'))s" -Level Info
-        
-        return $true
-    }
-    catch {
-        $duration = (Get-Date) - $stepStart
-        Write-Log "Failed to create backup archive after $($duration.TotalSeconds.ToString('F2'))s: $_" -Level Error
-        return $false
-    }
-}
-
 function Get-BackupArchive {
     <#
     .SYNOPSIS
-        Downloads the backup archive from remote server to local machine.
+        Streams backup archive directly from remote server to local machine via SSH.
+        No archive is created on the remote server - tar output streams directly through SSH.
     #>
     [CmdletBinding()]
     param(
@@ -2067,61 +1936,27 @@ function Get-BackupArchive {
         [hashtable]$Config
     )
     
-    Write-StepHeader "Downloading Backup Archive"
+    Write-StepHeader "Streaming Backup from Remote Server"
     
     $stepStart = Get-Date
     
     try {
         $localPath = Join-Path $LOCAL_BACKUP_DIR $BACKUP_NAME
         
-        Write-Log "Downloading from: $($Config.SSHUser)@$($Config.SSHHost):$REMOTE_BACKUP_PATH" -Level Info
-        Write-Log "Downloading to: $localPath" -Level Info
+        # Check if path contains wildcard
+        $hasWildcard = $Config.RemotePath -match '\*'
+        
+        Write-Log "Source: $($Config.SSHUser)@$($Config.SSHHost):$($Config.RemotePath)" -Level Info
+        Write-Log "Destination: $localPath" -Level Info
+        
+        if ($hasWildcard) {
+            Write-Log "Wildcard pattern detected - will backup all matching directories" -Level Info
+        }
         
         if ($DryRun) {
-            Write-Log "[DRY RUN] Would download archive to $localPath" -Level Warning
+            Write-Log "[DRY RUN] Would stream backup to $localPath" -Level Warning
             return $localPath
         }
-        
-        # First verify remote file exists and is readable
-        Write-Log "Verifying remote file exists and is accessible..." -Level Info
-        
-        # Check file existence and readability separately for better error reporting
-        $checkExists = "ssh -p $($Config.SSHPort) $($Config.SSHUser)@$($Config.SSHHost) 'test -f $REMOTE_BACKUP_PATH && echo EXISTS || echo NOT_FOUND'"
-        $existsResult = Invoke-Expression $checkExists 2>&1
-        
-        if ($LASTEXITCODE -ne 0 -or ($existsResult -notmatch "EXISTS")) {
-            Write-Log "File existence check output: $existsResult" -Level Error
-            throw "Remote archive file not found: $REMOTE_BACKUP_PATH"
-        }
-        
-        # Check readability
-        $checkReadable = "ssh -p $($Config.SSHPort) $($Config.SSHUser)@$($Config.SSHHost) 'test -r $REMOTE_BACKUP_PATH && echo READABLE || echo NOT_READABLE'"
-        $readableResult = Invoke-Expression $checkReadable 2>&1
-        
-        if ($LASTEXITCODE -ne 0 -or ($readableResult -notmatch "READABLE")) {
-            Write-Log "File readability check output: $readableResult" -Level Error
-            throw "Remote archive file is not readable: $REMOTE_BACKUP_PATH. Please check file permissions."
-        }
-        
-        # Get file info
-        $fileInfoCommand = "ssh -p $($Config.SSHPort) $($Config.SSHUser)@$($Config.SSHHost) 'ls -lh $REMOTE_BACKUP_PATH'"
-        $fileInfo = Invoke-Expression $fileInfoCommand 2>&1
-        
-        if ($LASTEXITCODE -eq 0) {
-            Write-Log "Remote file info: $fileInfo" -Level Info
-            
-            # Check file size - warn if suspiciously small
-            $sizeBytesCommand = "ssh -p $($Config.SSHPort) $($Config.SSHUser)@$($Config.SSHHost) 'stat -c%s $REMOTE_BACKUP_PATH 2>/dev/null || echo 0'"
-            $sizeBytes = Invoke-Expression $sizeBytesCommand 2>&1
-            if ($LASTEXITCODE -eq 0 -and $sizeBytes -match '^\d+$') {
-                $sizeBytesInt = [long]$sizeBytes
-                if ($sizeBytesInt -lt 1048576) {  # Less than 1MB
-                    Write-Log "Warning: Archive size is very small ($sizeBytesInt bytes / $([math]::Round($sizeBytesInt/1KB, 2)) KB). Archive may be empty or incomplete." -Level Warning
-                }
-            }
-        }
-        
-        Write-Log "Remote file verified, starting download..." -Level Success
         
         # Ensure local directory exists
         $localDir = Split-Path -Parent $localPath
@@ -2130,54 +1965,79 @@ function Get-BackupArchive {
             Write-Log "Created local directory: $localDir" -Level Info
         }
         
-        # Download using SSH with cat (more reliable than SCP when SFTP is chrooted)
-        # Some hosting providers (like Cloudways) chroot SFTP, but SSH works fine
-        Write-Log "Downloading file via SSH..." -Level Info
-        $downloadCommand = "ssh -p $($Config.SSHPort) $($Config.SSHUser)@$($Config.SSHHost) 'cat $REMOTE_BACKUP_PATH'"
-        Write-Log "Executing download via SSH cat..." -Level Info
+        # Build tar command based on path type
+        if ($hasWildcard) {
+            # For wildcard paths, tar the glob pattern directly (shell expands it)
+            $tarCommand = "tar -czf - --ignore-failed-read $($Config.RemotePath) 2>/dev/null"
+        }
+        else {
+            # For single path, cd into directory and tar current dir
+            $tarCommand = "cd '$($Config.RemotePath)' && tar -czf - . 2>/dev/null"
+        }
+        
+        Write-Log "Streaming backup via SSH (no server-side archive created)..." -Level Info
+        Write-Log "Remote command: $tarCommand" -Level Info
+        
+        # Stream tar output directly through SSH to local file
+        # Using Start-Process to avoid PowerShell interpreting redirections
+        $sshArgs = @("-p", "$($Config.SSHPort)", "$($Config.SSHUser)@$($Config.SSHHost)", $tarCommand)
+        $errorFile = [System.IO.Path]::GetTempFileName()
+        
+        Write-Log "Starting backup stream (this may take a while for large backups)..." -Level Info
+        Write-Host ""
         
         try {
-            # Use SSH with cat to download, redirect to file
-            $process = Start-Process -FilePath "ssh" `
-                -ArgumentList "-p", "$($Config.SSHPort)", "$($Config.SSHUser)@$($Config.SSHHost)", "cat $REMOTE_BACKUP_PATH" `
+            $streamProcess = Start-Process -FilePath "ssh" `
+                -ArgumentList $sshArgs `
                 -Wait -NoNewWindow -PassThru `
                 -RedirectStandardOutput $localPath `
-                -RedirectStandardError "ssh_error.tmp"
+                -RedirectStandardError $errorFile
             
-            if ($process.ExitCode -ne 0) {
-                $stderr = if (Test-Path "ssh_error.tmp") { Get-Content "ssh_error.tmp" -Raw; Remove-Item "ssh_error.tmp" -ErrorAction SilentlyContinue } else { "" }
-                throw "Failed to download archive via SSH. Exit code: $($process.ExitCode), Error: $stderr"
+            if ($streamProcess.ExitCode -ne 0) {
+                $stderr = if (Test-Path $errorFile) { Get-Content $errorFile -Raw } else { "" }
+                # tar with --ignore-failed-read may return exit code 1 for minor issues, check if file was created
+                if (-not (Test-Path $localPath) -or (Get-Item $localPath).Length -eq 0) {
+                    throw "Failed to stream backup via SSH. Exit code: $($streamProcess.ExitCode), Error: $stderr"
+                }
+                else {
+                    Write-Log "Tar completed with warnings (exit code $($streamProcess.ExitCode)). Continuing..." -Level Warning
+                }
             }
-            
-            # Cleanup error file if it exists
-            if (Test-Path "ssh_error.tmp") { Remove-Item "ssh_error.tmp" -ErrorAction SilentlyContinue }
-            
-            Write-Log "Download via SSH completed" -Level Success
         }
-        catch {
-            if (Test-Path "ssh_error.tmp") { Remove-Item "ssh_error.tmp" -ErrorAction SilentlyContinue }
-            throw
+        finally {
+            if (Test-Path $errorFile) { Remove-Item $errorFile -Force -ErrorAction SilentlyContinue }
         }
         
-        # Verify download
+        Write-Host ""
+        
+        # Verify the backup was created
         if (-not (Test-Path $localPath)) {
-            throw "Archive file not found after download: $localPath"
+            throw "Backup file not found after streaming: $localPath"
         }
         
         $fileInfo = Get-Item $localPath
-        $fileSizeMB = [math]::Round($fileInfo.Length / 1MB, 2)
+        $fileSizeBytes = $fileInfo.Length
+        $fileSizeMB = [math]::Round($fileSizeBytes / 1MB, 2)
+        $fileSizeGB = [math]::Round($fileSizeBytes / 1GB, 2)
+        
+        # Warn if suspiciously small
+        if ($fileSizeBytes -lt 1048576) {  # Less than 1MB
+            Write-Log "Warning: Backup size is very small ($fileSizeMB MB). Backup may be empty or incomplete." -Level Warning
+        }
         
         $duration = (Get-Date) - $stepStart
-        Write-Log "Download completed successfully" -Level Success
+        $sizeDisplay = if ($fileSizeGB -ge 1) { "$fileSizeGB GB" } else { "$fileSizeMB MB" }
+        
+        Write-Log "Backup stream completed successfully" -Level Success
         Write-Log "Local file: $localPath" -Level Info
-        Write-Log "File size: $fileSizeMB MB" -Level Info
-        Write-Log "Duration: $($duration.TotalSeconds.ToString('F2'))s" -Level Info
+        Write-Log "File size: $sizeDisplay" -Level Info
+        Write-Log "Duration: $($duration.TotalSeconds.ToString('F2'))s ($([math]::Round($duration.TotalMinutes, 1)) minutes)" -Level Info
         
         return $localPath
     }
     catch {
         $duration = (Get-Date) - $stepStart
-        Write-Log "Failed to download archive after $($duration.TotalSeconds.ToString('F2'))s: $_" -Level Error
+        Write-Log "Failed to stream backup after $($duration.TotalSeconds.ToString('F2'))s: $_" -Level Error
         return $null
     }
 }
@@ -2319,7 +2179,8 @@ function Remove-OldBackups {
 function Remove-TempFiles {
     <#
     .SYNOPSIS
-        Cleans up temporary files from local and remote locations.
+        Cleans up temporary local backup file after upload to Google Drive.
+        Note: No remote cleanup needed since backup streams directly without creating server-side files.
     #>
     [CmdletBinding()]
     param(
@@ -2335,22 +2196,21 @@ function Remove-TempFiles {
     $stepStart = Get-Date
     
     try {
-        # Remove local backup file
+        # Remove local backup file (after successful upload to Google Drive)
         if (-not [string]::IsNullOrEmpty($LocalPath) -and (Test-Path $LocalPath)) {
-            Write-Log "Removing local file: $LocalPath" -Level Info
+            Write-Log "Removing local temp file: $LocalPath" -Level Info
             
             if (-not $DryRun) {
                 Remove-Item -Path $LocalPath -Force -ErrorAction Stop
-                Write-Log "Local file removed successfully" -Level Success
+                Write-Log "Local temp file removed successfully" -Level Success
             }
             else {
-                Write-Log "[DRY RUN] Would remove local file" -Level Warning
+                Write-Log "[DRY RUN] Would remove local temp file" -Level Warning
             }
         }
-        
-        # Skip removing remote backup file - it's a permanent backup location (backup.tgz)
-        # The remote backup file is kept as a permanent backup on the server
-        Write-Log "Keeping remote backup file: $REMOTE_BACKUP_PATH (permanent backup location)" -Level Info
+        else {
+            Write-Log "No local temp files to clean up" -Level Info
+        }
         
         $duration = (Get-Date) - $stepStart
         Write-Log "Cleanup completed (Duration: $($duration.TotalSeconds.ToString('F2'))s)" -Level Success
@@ -2442,47 +2302,26 @@ function Invoke-Backup {
         # Load configuration
         $config = Get-StoredCredentials
         
-        # Set remote backup path to use existing backup.tgz file
-        # Check if path contains wildcard pattern
+        # Log backup source info
         $hasWildcard = $config.RemotePath -match '\*'
-        
         if ($hasWildcard) {
-            # For wildcard paths, store backup in user's home directory
-            # Extract base path before the wildcard (e.g., /home/user/applications from /home/user/applications/*/local_backups)
-            $basePath = $config.RemotePath -replace '/\*.*$', ''
-            $script:REMOTE_BACKUP_PATH = "$basePath/backup.tgz"
             Write-Log "Wildcard pattern detected: $($config.RemotePath)" -Level Info
             Write-Log "Backing up ALL matching directories" -Level Info
         }
         else {
-            # For single path, store in local_backups directory
-            # Calculate local_backups path: if RemotePath ends with /local_backups, use it; otherwise use parent/local_backups
-            if ($config.RemotePath -match '/local_backups/?$') {
-                $localBackupsPath = $config.RemotePath -replace '/local_backups/?$', '/local_backups'
-            } else {
-                # Get parent directory and append local_backups
-                $parentPath = $config.RemotePath -replace '/[^/]+/?$', ''
-                $localBackupsPath = "$parentPath/local_backups"
-            }
-            $script:REMOTE_BACKUP_PATH = "$localBackupsPath/backup.tgz"
             Write-Log "Backing up directory: $($config.RemotePath)" -Level Info
         }
-        Write-Log "Backup file location: $script:REMOTE_BACKUP_PATH" -Level Info
         
         # Test SSH connection
         if (-not (Test-SSHConnection -Config $config)) {
             throw "SSH connection test failed"
         }
         
-        # Create backup archive on remote server
-        if (-not (New-BackupArchive -Config $config)) {
-            throw "Failed to create backup archive"
-        }
-        
-        # Download backup archive
+        # Stream backup directly from remote server to local machine
+        # (No archive is created on the server - tar streams directly through SSH)
         $localBackupPath = Get-BackupArchive -Config $config
         if ([string]::IsNullOrEmpty($localBackupPath)) {
-            throw "Failed to download backup archive"
+            throw "Failed to stream backup from remote server"
         }
         
         # Upload to Google Drive
