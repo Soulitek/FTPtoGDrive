@@ -1336,57 +1336,73 @@ function Invoke-InteractiveSetup {
     # STEP 4: Determine Backup Paths
     Show-ProgressStep -Step 4 -TotalSteps 8 -Description "Website Location"
     
-    Write-ColorMessage "Please enter the path to your website files on the server." -Type Info
-    Write-Host ""
-    Write-ColorMessage "Common examples:" -Type Info
-    Write-Host "  - /home/username/public_html" -ForegroundColor Yellow
-    Write-Host "  - /home/username/applications/myapp/public_html" -ForegroundColor Yellow
-    Write-Host "  - /var/www/html" -ForegroundColor Yellow
-    Write-Host ""
-    Write-ColorMessage "TIP: You can use wildcards (*) to backup multiple folders at once!" -Type Info
-    Write-ColorMessage "Example: /home/username/applications/*/local_backups" -Type Info
-    Write-ColorMessage "         This will backup ALL local_backups folders from ALL applications." -Type Info
-    Write-Host ""
+    # Loop until user enters a valid path
+    $pathValid = $false
+    $remotePath = ""
     
-    $remotePath = Read-UserInput -Prompt "Enter the full path to your website files" -Required
-    
-    # Check if path contains wildcard
-    $hasWildcard = $remotePath -match '\*'
-    
-    # Verify the path exists
-    Write-Host ""
-    if ($hasWildcard) {
-        Write-ColorMessage "Wildcard path detected: $remotePath" -Type Info
-        Write-ColorMessage "Verifying wildcard pattern expands to valid directories..." -Type Info
+    while (-not $pathValid) {
+        Write-ColorMessage "Please enter the path to your website files on the server." -Type Info
+        Write-Host ""
+        Write-ColorMessage "Common examples:" -Type Info
+        Write-Host "  - /home/username/public_html" -ForegroundColor Yellow
+        Write-Host "  - /home/username/applications/myapp/public_html" -ForegroundColor Yellow
+        Write-Host "  - /var/www/html" -ForegroundColor Yellow
+        Write-Host ""
+        Write-ColorMessage "TIP: You can use wildcards (*) to backup multiple folders at once!" -Type Info
+        Write-ColorMessage "Example: /home/username/applications/*/local_backups" -Type Info
+        Write-ColorMessage "         This will backup ALL local_backups folders from ALL applications." -Type Info
+        Write-Host ""
         
-        # Test if the wildcard pattern matches any directories
-        $testWildcardCmd = "ssh -p $sshPort ${sshUser}@${sshHost} 'ls -d $remotePath 2>/dev/null | head -5'"
-        $wildcardResult = Invoke-Expression $testWildcardCmd 2>&1
+        $remotePath = Read-UserInput -Prompt "Enter the full path to your website files" -Required
         
-        if ($LASTEXITCODE -eq 0 -and $wildcardResult) {
-            $matchCount = ($wildcardResult | Measure-Object -Line).Lines
-            Write-ColorMessage "[OK] Pattern matches at least $matchCount directories!" -Type Success
-            Write-ColorMessage "Sample matches:" -Type Info
-            $wildcardResult | Select-Object -First 5 | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow }
-        }
-        else {
-            Write-ColorMessage "[X] Warning: Wildcard pattern doesn't match any directories." -Type Warning
-            $continue = Read-UserChoice -Prompt "Continue anyway?" -ValidChoices @('Y', 'N') -DefaultChoice 'N'
-            if ($continue -ne 'Y') {
-                return $null
+        # Check if path contains wildcard
+        $hasWildcard = $remotePath -match '\*'
+        
+        # Verify the path exists
+        Write-Host ""
+        if ($hasWildcard) {
+            Write-ColorMessage "Wildcard path detected: $remotePath" -Type Info
+            Write-ColorMessage "Verifying wildcard pattern expands to valid directories..." -Type Info
+            
+            # Test if the wildcard pattern matches any directories
+            $testWildcardCmd = "ssh -p $sshPort ${sshUser}@${sshHost} 'ls -d $remotePath 2>/dev/null | head -5'"
+            $wildcardResult = Invoke-Expression $testWildcardCmd 2>&1
+            
+            if ($LASTEXITCODE -eq 0 -and $wildcardResult) {
+                $matchCount = ($wildcardResult | Measure-Object -Line).Lines
+                Write-ColorMessage "[OK] Pattern matches at least $matchCount directories!" -Type Success
+                Write-ColorMessage "Sample matches:" -Type Info
+                $wildcardResult | Select-Object -First 5 | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow }
+                $pathValid = $true
+            }
+            else {
+                Write-ColorMessage "[X] Error: Wildcard pattern doesn't match any directories." -Type Error
+                Write-ColorMessage "Please check your path and try again." -Type Warning
+                Write-Host ""
+                
+                $retry = Read-UserChoice -Prompt "Try again?" -ValidChoices @('Y', 'N') -DefaultChoice 'Y'
+                if ($retry -ne 'Y') {
+                    return $null
+                }
+                Write-Host ""
             }
         }
-    }
-    else {
-        Write-ColorMessage "Verifying path: $remotePath" -Type Info
-        if (Test-RemotePathExists -User $sshUser -Hostname $sshHost -Port $sshPort -Path $remotePath) {
-            Write-ColorMessage "[OK] Path exists and is accessible!" -Type Success
-        }
         else {
-            Write-ColorMessage "[X] Warning: Path may not exist or is not accessible." -Type Warning
-            $continue = Read-UserChoice -Prompt "Continue anyway?" -ValidChoices @('Y', 'N') -DefaultChoice 'N'
-            if ($continue -ne 'Y') {
-                return $null
+            Write-ColorMessage "Verifying path: $remotePath" -Type Info
+            if (Test-RemotePathExists -User $sshUser -Hostname $sshHost -Port $sshPort -Path $remotePath) {
+                Write-ColorMessage "[OK] Path exists and is accessible!" -Type Success
+                $pathValid = $true
+            }
+            else {
+                Write-ColorMessage "[X] Error: Path does not exist or is not accessible." -Type Error
+                Write-ColorMessage "Please check your path and try again." -Type Warning
+                Write-Host ""
+                
+                $retry = Read-UserChoice -Prompt "Try again?" -ValidChoices @('Y', 'N') -DefaultChoice 'Y'
+                if ($retry -ne 'Y') {
+                    return $null
+                }
+                Write-Host ""
             }
         }
     }
@@ -1854,8 +1870,9 @@ function Test-Prerequisites {
     
     # Check SSH
     try {
+        $sshCheck = Get-Command ssh -ErrorAction Stop
         $sshVersion = ssh -V 2>&1
-        Write-Log "SSH client found: $sshVersion" -Level Success
+        Write-Log "SSH client found: $($sshCheck.Source)" -Level Success
     }
     catch {
         Write-Log "SSH client not found. Please install OpenSSH client." -Level Error
@@ -2368,6 +2385,7 @@ function Invoke-Backup {
     
     $backupSuccess = $false
     $localBackupPath = $null
+    $config = $null
     
     try {
         Write-Log "========================================" -Level Info
