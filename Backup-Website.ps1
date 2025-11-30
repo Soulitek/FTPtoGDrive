@@ -110,6 +110,11 @@ $LOG_DIR = "C:\Logs\website-backup"
 # Backup retention policy
 $BACKUP_RETENTION_COUNT = 7
 
+# Split archive configuration
+# Files larger than this will be split into multiple parts for reliable Google Drive download
+$SPLIT_SIZE_BYTES = 7GB  # 7 GB per part
+$SPLIT_SIZE_DISPLAY = "7 GB"
+
 # Credential Manager target name
 $CREDENTIAL_TARGET = "WebsiteBackup_SSH"
 
@@ -118,13 +123,15 @@ $SCRIPT_START_TIME = Get-Date
 
 # Backup name with timestamp
 $BACKUP_TIMESTAMP = Get-Date -Format "yyyyMMdd-HHmmss"
-$BACKUP_NAME = "website-$BACKUP_TIMESTAMP.tar.gz"
+$BACKUP_NAME_BASE = "website-$BACKUP_TIMESTAMP"
+$BACKUP_NAME = "$BACKUP_NAME_BASE.tar.gz"
 
 # Log file path
 $LOG_FILE = Join-Path $LOG_DIR "backup-$(Get-Date -Format 'yyyyMMdd').log"
 
 # Note: Backup is streamed directly from remote server to local machine via SSH
 # No archive is created on the remote server to save disk space
+# Large backups are automatically split into parts for reliable download
 
 # =============================================================================
 # INTERACTIVE SETUP HELPER FUNCTIONS
@@ -2062,48 +2069,98 @@ function Get-BackupArchive {
             $process.Start() | Out-Null
             $process.BeginErrorReadLine()
             Write-Log "SSH process started (PID: $($process.Id))" -Level Info
-            Write-Log "Streaming tar data to local file..." -Level Info
+            Write-Log "Streaming tar data to local file(s)..." -Level Info
+            Write-Log "Split size: $SPLIT_SIZE_DISPLAY per part" -Level Info
             
-            # Read stdout (tar data) and write to file
-            $outputStream = [System.IO.File]::Create($localPath)
+            # Track all created parts
+            $createdParts = [System.Collections.ArrayList]::new()
             $totalBytesWritten = 0
             $lastProgressBytes = 0
+            $currentPartNumber = 1
+            $currentPartBytes = 0
+            
+            # Create first part file
+            $currentPartPath = Join-Path $LOCAL_BACKUP_DIR "$BACKUP_NAME_BASE.part$($currentPartNumber.ToString('D3')).tar.gz"
+            $outputStream = [System.IO.File]::Create($currentPartPath)
+            [void]$createdParts.Add($currentPartPath)
+            Write-Log "Creating part $currentPartNumber : $currentPartPath" -Level Info
             
             try {
                 $buffer = New-Object byte[] 65536
                 $stdoutStream = $process.StandardOutput.BaseStream
                 
-                Write-Log "Reading data stream (buffer size: 64KB)..." -Level Info
+                Write-Log "Reading data stream (buffer size: 64KB, split at: $SPLIT_SIZE_DISPLAY)..." -Level Info
                 
                 while ($true) {
                     $bytesRead = $stdoutStream.Read($buffer, 0, $buffer.Length)
                     if ($bytesRead -eq 0) { break }
-                    $outputStream.Write($buffer, 0, $bytesRead)
-                    $totalBytesWritten += $bytesRead
+                    
+                    # Check if we need to split to a new part
+                    if (($currentPartBytes + $bytesRead) -gt $SPLIT_SIZE_BYTES) {
+                        # Calculate how many bytes fit in current part
+                        $bytesForCurrentPart = $SPLIT_SIZE_BYTES - $currentPartBytes
+                        
+                        if ($bytesForCurrentPart -gt 0) {
+                            $outputStream.Write($buffer, 0, $bytesForCurrentPart)
+                            $currentPartBytes += $bytesForCurrentPart
+                            $totalBytesWritten += $bytesForCurrentPart
+                        }
+                        
+                        # Close current part
+                        $outputStream.Close()
+                        $partSizeGB = [math]::Round($currentPartBytes / 1GB, 2)
+                        Write-Host ""
+                        Write-Log "Part $currentPartNumber completed: $partSizeGB GB" -Level Success
+                        
+                        # Start new part
+                        $currentPartNumber++
+                        $currentPartPath = Join-Path $LOCAL_BACKUP_DIR "$BACKUP_NAME_BASE.part$($currentPartNumber.ToString('D3')).tar.gz"
+                        $outputStream = [System.IO.File]::Create($currentPartPath)
+                        [void]$createdParts.Add($currentPartPath)
+                        Write-Log "Creating part $currentPartNumber : $currentPartPath" -Level Info
+                        $currentPartBytes = 0
+                        
+                        # Write remaining bytes to new part
+                        $remainingBytes = $bytesRead - $bytesForCurrentPart
+                        if ($remainingBytes -gt 0) {
+                            $outputStream.Write($buffer, $bytesForCurrentPart, $remainingBytes)
+                            $currentPartBytes += $remainingBytes
+                            $totalBytesWritten += $remainingBytes
+                        }
+                    }
+                    else {
+                        # Write all bytes to current part
+                        $outputStream.Write($buffer, 0, $bytesRead)
+                        $currentPartBytes += $bytesRead
+                        $totalBytesWritten += $bytesRead
+                    }
+                    
                     $script:streamBytesWritten = $totalBytesWritten
                     
-                    # Periodically show file size progress
+                    # Periodically show progress
                     $now = Get-Date
                     if (($now - $lastReportTime).TotalSeconds -ge 5) {
-                        $currentSize = $outputStream.Length
-                        $sizeMB = [math]::Round($currentSize / 1MB, 1)
-                        $sizeGB = [math]::Round($currentSize / 1GB, 2)
+                        $totalSizeMB = [math]::Round($totalBytesWritten / 1MB, 1)
+                        $totalSizeGB = [math]::Round($totalBytesWritten / 1GB, 2)
+                        $partSizeMB = [math]::Round($currentPartBytes / 1MB, 1)
+                        $partSizeGB = [math]::Round($currentPartBytes / 1GB, 2)
                         $elapsed = $now - $startTime
                         $elapsedStr = "{0:hh\:mm\:ss}" -f $elapsed
                         
                         # Calculate transfer speed
-                        $bytesInInterval = $currentSize - $lastProgressBytes
+                        $bytesInInterval = $totalBytesWritten - $lastProgressBytes
                         $speedMBps = [math]::Round($bytesInInterval / 5 / 1MB, 2)
-                        $lastProgressBytes = $currentSize
+                        $lastProgressBytes = $totalBytesWritten
                         
-                        $sizeDisplay = if ($sizeGB -ge 1) { "${sizeGB} GB" } else { "${sizeMB} MB" }
+                        $totalDisplay = if ($totalSizeGB -ge 1) { "${totalSizeGB} GB" } else { "${totalSizeMB} MB" }
+                        $partDisplay = if ($partSizeGB -ge 1) { "${partSizeGB} GB" } else { "${partSizeMB} MB" }
                         
                         Write-Host ""
-                        Write-Host "  [$elapsedStr] Archive: $sizeDisplay | Speed: ${speedMBps} MB/s | Files: $($script:streamFileCount)" -ForegroundColor Green
+                        Write-Host "  [$elapsedStr] Total: $totalDisplay | Part $currentPartNumber : $partDisplay | Speed: ${speedMBps} MB/s | Files: $($script:streamFileCount)" -ForegroundColor Green
                         
                         # Also log to file periodically
                         if (($now - $lastReportTime).TotalSeconds -ge 30) {
-                            Write-Log "Progress: $sizeDisplay transferred, $($script:streamFileCount) files, Speed: ${speedMBps} MB/s" -Level Info
+                            Write-Log "Progress: Total $totalDisplay, Part $currentPartNumber at $partDisplay, $($script:streamFileCount) files, Speed: ${speedMBps} MB/s" -Level Info
                         }
                         
                         $lastReportTime = $now
@@ -2112,7 +2169,11 @@ function Get-BackupArchive {
             }
             finally {
                 $outputStream.Close()
-                Write-Log "Output stream closed. Total bytes written: $totalBytesWritten" -Level Info
+                $partSizeGB = [math]::Round($currentPartBytes / 1GB, 2)
+                $partSizeMB = [math]::Round($currentPartBytes / 1MB, 2)
+                $partDisplay = if ($partSizeGB -ge 0.1) { "$partSizeGB GB" } else { "$partSizeMB MB" }
+                Write-Log "Final part $currentPartNumber closed: $partDisplay" -Level Info
+                Write-Log "Total bytes written across all parts: $totalBytesWritten" -Level Info
             }
             
             Write-Log "Waiting for SSH process to complete..." -Level Info
@@ -2126,7 +2187,8 @@ function Get-BackupArchive {
             
             if ($exitCode -ne 0) {
                 # tar with --ignore-failed-read may return exit code 1 for minor issues
-                if (-not (Test-Path $localPath) -or (Get-Item $localPath).Length -eq 0) {
+                $firstPart = $createdParts[0]
+                if (-not (Test-Path $firstPart) -or (Get-Item $firstPart).Length -eq 0) {
                     throw "Failed to stream backup via SSH. Exit code: $exitCode"
                 }
                 else {
@@ -2138,6 +2200,9 @@ function Get-BackupArchive {
             if ($script:streamLastFile -ne "") {
                 Write-Log "Last file processed: $($script:streamLastFile)" -Level Info
             }
+            
+            # Store created parts for return
+            $script:backupParts = $createdParts
         }
         finally {
             Unregister-Event -SourceIdentifier $stdErrEvent.Name -ErrorAction SilentlyContinue
@@ -2148,47 +2213,59 @@ function Get-BackupArchive {
             $process.Dispose()
         }
         
-        # Verify the backup was created
-        Write-Log "Verifying local backup file..." -Level Info
-        if (-not (Test-Path $localPath)) {
-            throw "Backup file not found after streaming: $localPath"
+        # Verify all backup parts were created
+        Write-Log "Verifying local backup files..." -Level Info
+        Write-Log "Total parts created: $($script:backupParts.Count)" -Level Info
+        
+        $totalSizeBytes = 0
+        $partNumber = 0
+        foreach ($partPath in $script:backupParts) {
+            $partNumber++
+            if (-not (Test-Path $partPath)) {
+                throw "Backup part not found after streaming: $partPath"
+            }
+            
+            $partInfo = Get-Item $partPath
+            $partSizeBytes = $partInfo.Length
+            $partSizeMB = [math]::Round($partSizeBytes / 1MB, 2)
+            $partSizeGB = [math]::Round($partSizeBytes / 1GB, 2)
+            $partDisplay = if ($partSizeGB -ge 1) { "$partSizeGB GB" } else { "$partSizeMB MB" }
+            $totalSizeBytes += $partSizeBytes
+            
+            Write-Log "Part $partNumber : $(Split-Path -Leaf $partPath) - $partDisplay" -Level Info
         }
         
-        $fileInfo = Get-Item $localPath
-        $fileSizeBytes = $fileInfo.Length
-        $fileSizeMB = [math]::Round($fileSizeBytes / 1MB, 2)
-        $fileSizeGB = [math]::Round($fileSizeBytes / 1GB, 2)
+        $totalSizeMB = [math]::Round($totalSizeBytes / 1MB, 2)
+        $totalSizeGB = [math]::Round($totalSizeBytes / 1GB, 2)
         
-        Write-Log "Local backup file verified: $localPath" -Level Info
-        Write-Log "File exists: Yes" -Level Info
-        Write-Log "File size (bytes): $fileSizeBytes" -Level Info
-        Write-Log "File size (MB): $fileSizeMB" -Level Info
-        Write-Log "File size (GB): $fileSizeGB" -Level Info
-        Write-Log "File created: $($fileInfo.CreationTime)" -Level Info
-        Write-Log "File last modified: $($fileInfo.LastWriteTime)" -Level Info
+        Write-Log "All parts verified successfully" -Level Info
+        Write-Log "Total size (bytes): $totalSizeBytes" -Level Info
+        Write-Log "Total size (MB): $totalSizeMB" -Level Info
+        Write-Log "Total size (GB): $totalSizeGB" -Level Info
         
         # Warn if suspiciously small
-        if ($fileSizeBytes -lt 1048576) {  # Less than 1MB
-            Write-Log "WARNING: Backup size is very small ($fileSizeMB MB). Backup may be empty or incomplete." -Level Warning
+        if ($totalSizeBytes -lt 1048576) {  # Less than 1MB
+            Write-Log "WARNING: Backup size is very small ($totalSizeMB MB). Backup may be empty or incomplete." -Level Warning
             Write-Log "Expected to process files but backup is under 1MB - please verify source path." -Level Warning
         }
         
         $duration = (Get-Date) - $stepStart
-        $sizeDisplay = if ($fileSizeGB -ge 1) { "$fileSizeGB GB" } else { "$fileSizeMB MB" }
+        $sizeDisplay = if ($totalSizeGB -ge 1) { "$totalSizeGB GB" } else { "$totalSizeMB MB" }
         
         # Calculate transfer rate
-        $transferRateMBps = [math]::Round($fileSizeMB / $duration.TotalSeconds, 2)
+        $transferRateMBps = [math]::Round($totalSizeMB / $duration.TotalSeconds, 2)
         
         Write-Log "========================================" -Level Success
         Write-Log "Backup stream completed successfully!" -Level Success
         Write-Log "========================================" -Level Success
-        Write-Log "Local file: $localPath" -Level Info
-        Write-Log "File size: $sizeDisplay" -Level Info
+        Write-Log "Total parts: $($script:backupParts.Count)" -Level Info
+        Write-Log "Total size: $sizeDisplay" -Level Info
         Write-Log "Files/directories processed: $($script:streamFileCount)" -Level Info
         Write-Log "Duration: $($duration.TotalSeconds.ToString('F2'))s ($([math]::Round($duration.TotalMinutes, 1)) minutes)" -Level Info
         Write-Log "Average transfer rate: $transferRateMBps MB/s" -Level Info
         
-        return $localPath
+        # Return array of part paths
+        return $script:backupParts.ToArray()
     }
     catch {
         $duration = (Get-Date) - $stepStart
@@ -2200,12 +2277,12 @@ function Get-BackupArchive {
 function Publish-ToGoogleDrive {
     <#
     .SYNOPSIS
-        Uploads the backup archive to Google Drive using rclone.
+        Uploads the backup archive parts to Google Drive using rclone.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory=$true)]
-        [string]$LocalPath,
+        [string[]]$LocalPaths,
         
         [Parameter(Mandatory=$true)]
         [hashtable]$Config
@@ -2216,85 +2293,113 @@ function Publish-ToGoogleDrive {
     $stepStart = Get-Date
     
     try {
-        # Get file info for verbose logging
-        $fileInfo = Get-Item $LocalPath
-        $fileSizeBytes = $fileInfo.Length
-        $fileSizeMB = [math]::Round($fileSizeBytes / 1MB, 2)
-        $fileSizeGB = [math]::Round($fileSizeBytes / 1GB, 2)
-        $sizeDisplay = if ($fileSizeGB -ge 1) { "$fileSizeGB GB" } else { "$fileSizeMB MB" }
-        
-        Write-Log "Source file: $LocalPath" -Level Info
-        Write-Log "Source file size: $sizeDisplay ($fileSizeBytes bytes)" -Level Info
+        $totalParts = $LocalPaths.Count
+        Write-Log "Total parts to upload: $totalParts" -Level Info
         Write-Log "Destination remote: $($Config.GDriveRemote)" -Level Info
-        Write-Log "Destination path: $($Config.GDriveRemote)/$BACKUP_NAME" -Level Info
+        
+        # Calculate total size across all parts
+        $totalSizeBytes = 0
+        foreach ($partPath in $LocalPaths) {
+            $partInfo = Get-Item $partPath
+            $totalSizeBytes += $partInfo.Length
+        }
+        $totalSizeMB = [math]::Round($totalSizeBytes / 1MB, 2)
+        $totalSizeGB = [math]::Round($totalSizeBytes / 1GB, 2)
+        $totalSizeDisplay = if ($totalSizeGB -ge 1) { "$totalSizeGB GB" } else { "$totalSizeMB MB" }
+        
+        Write-Log "Total size to upload: $totalSizeDisplay ($totalSizeBytes bytes)" -Level Info
         
         if ($DryRun) {
-            Write-Log "[DRY RUN] Would upload to Google Drive" -Level Warning
+            Write-Log "[DRY RUN] Would upload $totalParts parts to Google Drive" -Level Warning
             return $true
         }
         
         # Estimate upload time based on typical speeds
-        $estimatedMinutes = [math]::Round($fileSizeBytes / (10 * 1MB) / 60, 1)  # Assuming ~10 MB/s
-        Write-Log "Estimated upload time: ~$estimatedMinutes minutes (depends on connection speed)" -Level Info
+        $estimatedMinutes = [math]::Round($totalSizeBytes / (10 * 1MB) / 60, 1)  # Assuming ~10 MB/s
+        Write-Log "Estimated total upload time: ~$estimatedMinutes minutes (depends on connection speed)" -Level Info
         
-        # Upload using rclone with progress and verbose output
-        $rcloneCommand = "rclone copy `"$LocalPath`" `"$($Config.GDriveRemote)`" --progress --stats 5s --verbose"
-        Write-Log "Executing rclone upload command..." -Level Info
-        Write-Log "Command: $rcloneCommand" -Level Info
         Write-Host ""
         Write-Host "  Starting Google Drive upload..." -ForegroundColor Cyan
-        Write-Host "  File: $BACKUP_NAME" -ForegroundColor Cyan
-        Write-Host "  Size: $sizeDisplay" -ForegroundColor Cyan
+        Write-Host "  Total parts: $totalParts" -ForegroundColor Cyan
+        Write-Host "  Total size: $totalSizeDisplay" -ForegroundColor Cyan
         Write-Host ""
         
-        $uploadStartTime = Get-Date
-        $result = Invoke-Expression $rcloneCommand 2>&1
-        $uploadEndTime = Get-Date
-        $uploadDuration = $uploadEndTime - $uploadStartTime
+        $uploadedParts = 0
+        $totalUploadedBytes = 0
+        $overallUploadStart = Get-Date
         
-        Write-Host ""
-        
-        if ($LASTEXITCODE -ne 0) {
-            Write-Log "Rclone exit code: $LASTEXITCODE" -Level Error
-            Write-Log "Rclone output: $result" -Level Error
-            throw "Failed to upload to Google Drive. Exit code: $LASTEXITCODE, Output: $result"
-        }
-        
-        Write-Log "Rclone upload process completed (exit code: $LASTEXITCODE)" -Level Info
-        Write-Log "Upload duration: $($uploadDuration.TotalSeconds.ToString('F2'))s ($([math]::Round($uploadDuration.TotalMinutes, 1)) minutes)" -Level Info
-        
-        # Calculate actual upload speed
-        $actualSpeedMBps = [math]::Round($fileSizeBytes / $uploadDuration.TotalSeconds / 1MB, 2)
-        Write-Log "Average upload speed: $actualSpeedMBps MB/s" -Level Info
-        
-        # Verify upload
-        Write-Log "Verifying upload on Google Drive..." -Level Info
-        $verifyCommand = "rclone ls `"$($Config.GDriveRemote)/$BACKUP_NAME`""
-        Write-Log "Verification command: $verifyCommand" -Level Info
-        $verifyResult = Invoke-Expression $verifyCommand 2>&1
-        
-        if ($LASTEXITCODE -ne 0) {
-            Write-Log "Verification failed - file not found on Google Drive" -Level Error
-            Write-Log "Verification output: $verifyResult" -Level Error
-            throw "Upload verification failed. File not found on Google Drive."
-        }
-        
-        # Parse verification result to confirm file size
-        Write-Log "Verification result: $verifyResult" -Level Info
-        if ($verifyResult -match '(\d+)') {
-            $remoteSize = [long]$Matches[1]
-            $remoteSizeGB = [math]::Round($remoteSize / 1GB, 2)
-            Write-Log "Remote file size verified: $remoteSizeGB GB ($remoteSize bytes)" -Level Info
+        foreach ($partPath in $LocalPaths) {
+            $uploadedParts++
+            $partName = Split-Path -Leaf $partPath
+            $partInfo = Get-Item $partPath
+            $partSizeBytes = $partInfo.Length
+            $partSizeMB = [math]::Round($partSizeBytes / 1MB, 2)
+            $partSizeGB = [math]::Round($partSizeBytes / 1GB, 2)
+            $partSizeDisplay = if ($partSizeGB -ge 1) { "$partSizeGB GB" } else { "$partSizeMB MB" }
             
-            if ($remoteSize -ne $fileSizeBytes) {
-                Write-Log "WARNING: Remote file size ($remoteSize) differs from local file size ($fileSizeBytes)" -Level Warning
-            } else {
-                Write-Log "File size verification passed - local and remote sizes match" -Level Success
+            Write-Log "----------------------------------------" -Level Info
+            Write-Log "Uploading part $uploadedParts of $totalParts : $partName" -Level Info
+            Write-Log "Part size: $partSizeDisplay ($partSizeBytes bytes)" -Level Info
+            
+            Write-Host ""
+            Write-Host "  [$uploadedParts/$totalParts] Uploading: $partName ($partSizeDisplay)" -ForegroundColor Cyan
+            
+            # Upload using rclone with progress
+            $rcloneCommand = "rclone copy `"$partPath`" `"$($Config.GDriveRemote)`" --progress --stats 5s --verbose"
+            Write-Log "Command: $rcloneCommand" -Level Info
+            
+            $partUploadStart = Get-Date
+            $result = Invoke-Expression $rcloneCommand 2>&1
+            $partUploadEnd = Get-Date
+            $partUploadDuration = $partUploadEnd - $partUploadStart
+            
+            if ($LASTEXITCODE -ne 0) {
+                Write-Log "Rclone exit code: $LASTEXITCODE" -Level Error
+                Write-Log "Rclone output: $result" -Level Error
+                throw "Failed to upload part $uploadedParts ($partName) to Google Drive. Exit code: $LASTEXITCODE"
             }
+            
+            $partSpeedMBps = [math]::Round($partSizeBytes / $partUploadDuration.TotalSeconds / 1MB, 2)
+            Write-Log "Part $uploadedParts uploaded in $($partUploadDuration.TotalSeconds.ToString('F2'))s (Speed: $partSpeedMBps MB/s)" -Level Success
+            
+            # Verify this part
+            Write-Log "Verifying part $uploadedParts on Google Drive..." -Level Info
+            $verifyCommand = "rclone ls `"$($Config.GDriveRemote)/$partName`""
+            $verifyResult = Invoke-Expression $verifyCommand 2>&1
+            
+            if ($LASTEXITCODE -ne 0) {
+                Write-Log "Verification failed for part $uploadedParts" -Level Error
+                throw "Upload verification failed for part $uploadedParts ($partName)"
+            }
+            
+            if ($verifyResult -match '(\d+)') {
+                $remoteSize = [long]$Matches[1]
+                if ($remoteSize -eq $partSizeBytes) {
+                    Write-Log "Part $uploadedParts verified: size matches ($remoteSize bytes)" -Level Success
+                } else {
+                    Write-Log "WARNING: Part $uploadedParts size mismatch - local: $partSizeBytes, remote: $remoteSize" -Level Warning
+                }
+            }
+            
+            $totalUploadedBytes += $partSizeBytes
+            $uploadedGB = [math]::Round($totalUploadedBytes / 1GB, 2)
+            $percentComplete = [math]::Round(($totalUploadedBytes / $totalSizeBytes) * 100, 1)
+            Write-Host "  Part $uploadedParts complete. Progress: $uploadedGB GB / $totalSizeDisplay ($percentComplete%)" -ForegroundColor Green
         }
+        
+        $overallUploadEnd = Get-Date
+        $overallUploadDuration = $overallUploadEnd - $overallUploadStart
+        $overallSpeedMBps = [math]::Round($totalSizeBytes / $overallUploadDuration.TotalSeconds / 1MB, 2)
+        
+        Write-Host ""
+        Write-Log "========================================" -Level Success
+        Write-Log "All $totalParts parts uploaded successfully!" -Level Success
+        Write-Log "========================================" -Level Success
+        Write-Log "Total uploaded: $totalSizeDisplay" -Level Info
+        Write-Log "Total upload time: $($overallUploadDuration.TotalSeconds.ToString('F2'))s ($([math]::Round($overallUploadDuration.TotalMinutes, 1)) minutes)" -Level Info
+        Write-Log "Average upload speed: $overallSpeedMBps MB/s" -Level Info
         
         $duration = (Get-Date) - $stepStart
-        Write-Log "Upload completed successfully!" -Level Success
         Write-Log "Total upload step duration: $($duration.TotalSeconds.ToString('F2'))s ($([math]::Round($duration.TotalMinutes, 1)) minutes)" -Level Info
         
         return $true
@@ -2325,53 +2430,82 @@ function Remove-OldBackups {
     $stepStart = Get-Date
     
     try {
-        Write-Log "Checking for old backups (keeping last $KeepCount)..." -Level Info
+        Write-Log "Checking for old backups (keeping last $KeepCount backup sets)..." -Level Info
         
         if ($DryRun) {
             Write-Log "[DRY RUN] Would remove old backups" -Level Warning
             return $true
         }
         
-        # List all backups
+        # List all backup files (including split parts)
         $listCommand = "rclone lsf `"$($Config.GDriveRemote)`" --files-only"
         Write-Log "Executing: $listCommand" -Level Info
         
-        $backups = Invoke-Expression $listCommand 2>&1 | Where-Object { $_ -match "^website-\d{8}-\d{6}\.tar\.gz$" }
+        # Match both single files and split parts: website-YYYYMMDD-HHMMSS.tar.gz or website-YYYYMMDD-HHMMSS.partNNN.tar.gz
+        $allFiles = Invoke-Expression $listCommand 2>&1 | Where-Object { $_ -match "^website-\d{8}-\d{6}(\.part\d{3})?\.tar\.gz$" }
         
         if ($LASTEXITCODE -ne 0) {
             Write-Log "Warning: Failed to list backups. Skipping rotation." -Level Warning
             return $true
         }
         
-        $backupCount = ($backups | Measure-Object).Count
-        Write-Log "Found $backupCount backup(s)" -Level Info
+        $totalFiles = ($allFiles | Measure-Object).Count
+        Write-Log "Found $totalFiles backup file(s) on Google Drive" -Level Info
         
-        if ($backupCount -le $KeepCount) {
-            Write-Log "No old backups to remove" -Level Info
+        # Group files by their base timestamp (website-YYYYMMDD-HHMMSS)
+        $backupSets = @{}
+        foreach ($file in $allFiles) {
+            if ($file -match "^(website-\d{8}-\d{6})") {
+                $baseTimestamp = $Matches[1]
+                if (-not $backupSets.ContainsKey($baseTimestamp)) {
+                    $backupSets[$baseTimestamp] = [System.Collections.ArrayList]::new()
+                }
+                [void]$backupSets[$baseTimestamp].Add($file)
+            }
+        }
+        
+        $backupSetCount = $backupSets.Count
+        Write-Log "Found $backupSetCount unique backup set(s)" -Level Info
+        
+        # List each backup set for verbose logging
+        foreach ($setKey in ($backupSets.Keys | Sort-Object)) {
+            $partCount = $backupSets[$setKey].Count
+            Write-Log "  Backup set: $setKey ($partCount part(s))" -Level Info
+        }
+        
+        if ($backupSetCount -le $KeepCount) {
+            Write-Log "No old backups to remove (have $backupSetCount, keeping $KeepCount)" -Level Info
             return $true
         }
         
-        # Sort by name (timestamp is in filename) and get old backups
-        $sortedBackups = $backups | Sort-Object
-        $backupsToRemove = $sortedBackups | Select-Object -First ($backupCount - $KeepCount)
+        # Sort backup sets by timestamp and get old ones to remove
+        $sortedSets = $backupSets.Keys | Sort-Object
+        $setsToRemove = $sortedSets | Select-Object -First ($backupSetCount - $KeepCount)
         
-        Write-Log "Removing $($backupsToRemove.Count) old backup(s)..." -Level Info
+        Write-Log "Removing $($setsToRemove.Count) old backup set(s)..." -Level Info
         
-        foreach ($backup in $backupsToRemove) {
-            Write-Log "Deleting: $backup" -Level Info
-            $deleteCommand = "rclone delete `"$($Config.GDriveRemote)/$backup`""
-            $result = Invoke-Expression $deleteCommand 2>&1
+        $totalFilesDeleted = 0
+        foreach ($setTimestamp in $setsToRemove) {
+            $filesToDelete = $backupSets[$setTimestamp]
+            Write-Log "Deleting backup set: $setTimestamp ($($filesToDelete.Count) file(s))" -Level Info
             
-            if ($LASTEXITCODE -eq 0) {
-                Write-Log "Deleted: $backup" -Level Success
+            foreach ($file in $filesToDelete) {
+                Write-Log "  Deleting: $file" -Level Info
+                $deleteCommand = "rclone delete `"$($Config.GDriveRemote)/$file`""
+                $result = Invoke-Expression $deleteCommand 2>&1
+                
+                if ($LASTEXITCODE -eq 0) {
+                    $totalFilesDeleted++
+                }
+                else {
+                    Write-Log "  Warning: Failed to delete $file - $result" -Level Warning
+                }
             }
-            else {
-                Write-Log "Warning: Failed to delete $backup - $result" -Level Warning
-            }
+            Write-Log "Backup set $setTimestamp deleted" -Level Success
         }
         
         $duration = (Get-Date) - $stepStart
-        Write-Log "Backup rotation completed (Duration: $($duration.TotalSeconds.ToString('F2'))s)" -Level Success
+        Write-Log "Backup rotation completed: removed $($setsToRemove.Count) set(s), $totalFilesDeleted file(s) (Duration: $($duration.TotalSeconds.ToString('F2'))s)" -Level Success
         
         return $true
     }
@@ -2385,7 +2519,7 @@ function Remove-OldBackups {
 function Remove-TempFiles {
     <#
     .SYNOPSIS
-        Cleans up temporary local backup file after upload to Google Drive.
+        Cleans up temporary local backup files after upload to Google Drive.
         Note: No remote cleanup needed since backup streams directly without creating server-side files.
     #>
     [CmdletBinding()]
@@ -2394,7 +2528,7 @@ function Remove-TempFiles {
         [hashtable]$Config,
         
         [Parameter(Mandatory=$false)]
-        [string]$LocalPath
+        [string[]]$LocalPaths
     )
     
     Write-StepHeader "Cleaning Up Temporary Files"
@@ -2402,20 +2536,31 @@ function Remove-TempFiles {
     $stepStart = Get-Date
     
     try {
-        # Remove local backup file (after successful upload to Google Drive)
-        if (-not [string]::IsNullOrEmpty($LocalPath) -and (Test-Path $LocalPath)) {
-            Write-Log "Removing local temp file: $LocalPath" -Level Info
-            
-            if (-not $DryRun) {
-                Remove-Item -Path $LocalPath -Force -ErrorAction Stop
-                Write-Log "Local temp file removed successfully" -Level Success
-            }
-            else {
-                Write-Log "[DRY RUN] Would remove local temp file" -Level Warning
+        if ($null -eq $LocalPaths -or $LocalPaths.Count -eq 0) {
+            Write-Log "No local temp files to clean up" -Level Info
+            return $true
+        }
+        
+        Write-Log "Cleaning up $($LocalPaths.Count) local temp file(s)..." -Level Info
+        
+        $removedCount = 0
+        foreach ($localPath in $LocalPaths) {
+            if (-not [string]::IsNullOrEmpty($localPath) -and (Test-Path $localPath)) {
+                $fileName = Split-Path -Leaf $localPath
+                Write-Log "Removing: $fileName" -Level Info
+                
+                if (-not $DryRun) {
+                    Remove-Item -Path $localPath -Force -ErrorAction Stop
+                    $removedCount++
+                }
+                else {
+                    Write-Log "[DRY RUN] Would remove: $fileName" -Level Warning
+                }
             }
         }
-        else {
-            Write-Log "No local temp files to clean up" -Level Info
+        
+        if ($removedCount -gt 0) {
+            Write-Log "Removed $removedCount local temp file(s)" -Level Success
         }
         
         $duration = (Get-Date) - $stepStart
@@ -2473,6 +2618,64 @@ function Send-BackupNotification {
     Write-Log "Email notifications are disabled. Enable in script if needed." -Level Info
 }
 
+function Show-BackupCompleteNotification {
+    <#
+    .SYNOPSIS
+        Shows a Windows message box notification when backup completes successfully.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$BackupName,
+        
+        [Parameter(Mandatory=$true)]
+        [int]$PartCount,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$TotalSize,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$Duration
+    )
+    
+    try {
+        # Load Windows Forms assembly for MessageBox
+        Add-Type -AssemblyName System.Windows.Forms
+        
+        $message = @"
+Backup completed successfully!
+
+Backup Name: $BackupName
+Parts: $PartCount
+Total Size: $TotalSize
+Duration: $Duration
+
+All files have been uploaded to Google Drive.
+"@
+        
+        $title = "Website Backup - Complete"
+        
+        [System.Windows.Forms.MessageBox]::Show(
+            $message,
+            $title,
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        ) | Out-Null
+        
+        Write-Log "Backup completion notification shown to user" -Level Info
+    }
+    catch {
+        Write-Log "Failed to show notification dialog: $_" -Level Warning
+        # Fallback to console message
+        Write-Host ""
+        Write-Host "========================================" -ForegroundColor Green
+        Write-Host "  BACKUP COMPLETED SUCCESSFULLY!" -ForegroundColor Green
+        Write-Host "========================================" -ForegroundColor Green
+        Write-Host $message -ForegroundColor Green
+        Write-Host ""
+    }
+}
+
 # =============================================================================
 # MAIN EXECUTION
 # =============================================================================
@@ -2486,13 +2689,14 @@ function Invoke-Backup {
     param()
     
     $backupSuccess = $false
-    $localBackupPath = $null
+    $localBackupPaths = $null
     $config = $null
     
     try {
         Write-Log "========================================" -Level Info
         Write-Log "  WEBSITE BACKUP SCRIPT" -Level Info
         Write-Log "  Started: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -Level Info
+        Write-Log "  Split size: $SPLIT_SIZE_DISPLAY per part" -Level Info
         Write-Log "========================================" -Level Info
         
         # Initialize environment
@@ -2525,15 +2729,29 @@ function Invoke-Backup {
         
         # Stream backup directly from remote server to local machine
         # (No archive is created on the server - tar streams directly through SSH)
-        $localBackupPath = Get-BackupArchive -Config $config
-        if ([string]::IsNullOrEmpty($localBackupPath)) {
+        # Large backups are automatically split into parts for reliable download
+        $localBackupPaths = Get-BackupArchive -Config $config
+        if ($null -eq $localBackupPaths -or $localBackupPaths.Count -eq 0) {
             throw "Failed to stream backup from remote server"
         }
         
-        # Upload to Google Drive
-        if (-not (Publish-ToGoogleDrive -LocalPath $localBackupPath -Config $config)) {
+        Write-Log "Backup created: $($localBackupPaths.Count) part(s)" -Level Info
+        
+        # Upload all parts to Google Drive
+        if (-not (Publish-ToGoogleDrive -LocalPaths $localBackupPaths -Config $config)) {
             throw "Failed to upload to Google Drive"
         }
+        
+        # Calculate total size for notification
+        $totalSizeBytes = 0
+        foreach ($partPath in $localBackupPaths) {
+            if (Test-Path $partPath) {
+                $totalSizeBytes += (Get-Item $partPath).Length
+            }
+        }
+        $totalSizeGB = [math]::Round($totalSizeBytes / 1GB, 2)
+        $totalSizeMB = [math]::Round($totalSizeBytes / 1MB, 2)
+        $totalSizeDisplay = if ($totalSizeGB -ge 1) { "$totalSizeGB GB" } else { "$totalSizeMB MB" }
         
         # Rotate old backups
         if (-not $SkipRotation) {
@@ -2544,6 +2762,13 @@ function Invoke-Backup {
         }
         
         $backupSuccess = $true
+        
+        # Show completion notification (only in interactive mode)
+        if (-not $NonInteractive) {
+            $uploadDuration = (Get-Date) - $SCRIPT_START_TIME
+            $durationDisplay = $uploadDuration.ToString('hh\:mm\:ss')
+            Show-BackupCompleteNotification -BackupName $BACKUP_NAME_BASE -PartCount $localBackupPaths.Count -TotalSize $totalSizeDisplay -Duration $durationDisplay
+        }
     }
     catch {
         Write-Log "BACKUP FAILED: $_" -Level Error
@@ -2553,15 +2778,17 @@ function Invoke-Backup {
     finally {
         # Always cleanup temporary files
         if ($null -ne $config) {
-            Remove-TempFiles -Config $config -LocalPath $localBackupPath
+            Remove-TempFiles -Config $config -LocalPaths $localBackupPaths
         }
         
         # Generate summary report
         Write-StepHeader "Backup Summary"
         
         $totalDuration = (Get-Date) - $SCRIPT_START_TIME
+        $partCount = if ($null -ne $localBackupPaths) { $localBackupPaths.Count } else { 0 }
         
-        Write-Log "Backup Name: $BACKUP_NAME" -Level Info
+        Write-Log "Backup Base Name: $BACKUP_NAME_BASE" -Level Info
+        Write-Log "Total Parts: $partCount" -Level Info
         Write-Log "Status: $(if ($backupSuccess) { 'SUCCESS' } else { 'FAILED' })" -Level $(if ($backupSuccess) { 'Success' } else { 'Error' })
         Write-Log "Total Duration: $($totalDuration.TotalSeconds.ToString('F2'))s ($($totalDuration.ToString('hh\:mm\:ss')))" -Level Info
         Write-Log "Ended: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -Level Info
@@ -2573,7 +2800,8 @@ function Invoke-Backup {
             $notificationDetails = @"
 Backup completed successfully!
 
-Backup Name: $BACKUP_NAME
+Backup Name: $BACKUP_NAME_BASE
+Parts: $partCount
 Duration: $($totalDuration.ToString('hh\:mm\:ss'))
 Log File: $LOG_FILE
 "@
@@ -2586,7 +2814,7 @@ Log File: $LOG_FILE
             $notificationDetails = @"
 Backup FAILED!
 
-Backup Name: $BACKUP_NAME
+Backup Name: $BACKUP_NAME_BASE
 Duration: $($totalDuration.ToString('hh\:mm\:ss'))
 Log File: $LOG_FILE
 
