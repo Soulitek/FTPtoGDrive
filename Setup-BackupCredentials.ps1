@@ -26,7 +26,7 @@
     Requirements:
     - OpenSSH client installed
     - SSH key generated and authorized on remote server
-    - Rclone installed and Google Drive remote configured
+    - Rclone installed and configured with Google Drive or OneDrive remote
     
     Author: Automated Backup System
     Version: 1.0.0

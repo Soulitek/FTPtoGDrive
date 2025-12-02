@@ -186,3 +186,7 @@ if ($corruptedFiles -gt 0 -or $missingFiles -gt 0) {
     exit 0
 }
 
+
+
+
+
