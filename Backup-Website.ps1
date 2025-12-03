@@ -86,6 +86,24 @@ param(
     [string]$GDriveRemote,
     
     [Parameter(Mandatory=$false)]
+    [switch]$UseSFTP,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$SFTPHost,
+    
+    [Parameter(Mandatory=$false)]
+    [int]$SFTPPort = 22,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$SFTPUser,
+    
+    [Parameter(Mandatory=$false)]
+    [SecureString]$SFTPPassword,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$SFTPKeyPath,
+    
+    [Parameter(Mandatory=$false)]
     [switch]$DryRun,
     
     [Parameter(Mandatory=$false)]
@@ -140,8 +158,11 @@ $BACKUP_NAME = "$BACKUP_NAME_BASE.tar.gz"
 # Log file path
 $LOG_FILE = Join-Path $LOG_DIR "backup-$(Get-Date -Format 'yyyyMMdd').log"
 
-# Note: Backup is streamed directly from remote server to local machine via SSH
-# No archive is created on the remote server to save disk space
+# Note: Backup can use either:
+# 1. SSH streaming (default): Streams tar output directly from remote server to local machine via SSH
+#    No archive is created on the remote server to save disk space
+# 2. SFTP download (UseSFTP flag): Downloads files individually via SFTP and creates archive locally
+#    More reliable for large files, avoids SSH streaming corruption
 # Large backups are automatically split into parts for reliable download
 
 # =============================================================================
@@ -1845,6 +1866,12 @@ function Get-StoredCredentials {
             SSHPort = $script:SSHPort
             RemotePath = $script:RemotePath
             GDriveRemote = $script:GDriveRemote
+            UseSFTP = $script:UseSFTP
+            SFTPHost = $script:SFTPHost
+            SFTPPort = $script:SFTPPort
+            SFTPUser = $script:SFTPUser
+            SFTPPassword = $script:SFTPPassword
+            SFTPKeyPath = $script:SFTPKeyPath
             ScheduleFrequency = $null
             ScheduleTime = $null
         }
@@ -1861,6 +1888,12 @@ function Get-StoredCredentials {
                     if ([string]::IsNullOrEmpty($config.SSHHost)) { $config.SSHHost = $regConfig.SSHHost }
                     if ([string]::IsNullOrEmpty($config.RemotePath)) { $config.RemotePath = $regConfig.RemotePath }
                     if ([string]::IsNullOrEmpty($config.GDriveRemote)) { $config.GDriveRemote = $regConfig.GDriveRemote }
+                    # Load SFTP settings if available
+                    if ($regConfig.UseSFTP) { $config.UseSFTP = [bool]$regConfig.UseSFTP }
+                    if ($regConfig.SFTPHost) { $config.SFTPHost = $regConfig.SFTPHost }
+                    if ($regConfig.SFTPPort) { $config.SFTPPort = $regConfig.SFTPPort }
+                    if ($regConfig.SFTPUser) { $config.SFTPUser = $regConfig.SFTPUser }
+                    if ($regConfig.SFTPKeyPath) { $config.SFTPKeyPath = $regConfig.SFTPKeyPath }
                     # Load schedule information if available
                     if ($regConfig.ScheduleFrequency) { $config.ScheduleFrequency = $regConfig.ScheduleFrequency }
                     if ($regConfig.ScheduleTime) { $config.ScheduleTime = $regConfig.ScheduleTime }
@@ -1872,18 +1905,51 @@ function Get-StoredCredentials {
             if (Test-Path $regPath) {
                 $regConfig = Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue
                 if ($regConfig) {
+                    # Load SFTP settings if not provided as parameters
+                    if (-not $config.UseSFTP -and $regConfig.UseSFTP) { $config.UseSFTP = [bool]$regConfig.UseSFTP }
+                    if ([string]::IsNullOrEmpty($config.SFTPHost) -and $regConfig.SFTPHost) { $config.SFTPHost = $regConfig.SFTPHost }
+                    if (-not $config.SFTPPort -and $regConfig.SFTPPort) { $config.SFTPPort = $regConfig.SFTPPort }
+                    if ([string]::IsNullOrEmpty($config.SFTPUser) -and $regConfig.SFTPUser) { $config.SFTPUser = $regConfig.SFTPUser }
+                    if ([string]::IsNullOrEmpty($config.SFTPKeyPath) -and $regConfig.SFTPKeyPath) { $config.SFTPKeyPath = $regConfig.SFTPKeyPath }
                     if ($regConfig.ScheduleFrequency) { $config.ScheduleFrequency = $regConfig.ScheduleFrequency }
                     if ($regConfig.ScheduleTime) { $config.ScheduleTime = $regConfig.ScheduleTime }
                 }
             }
         }
         
-        # Validate required configuration
-        if ([string]::IsNullOrEmpty($config.SSHUser)) {
-            throw "SSH User not configured. Run Setup-BackupCredentials.ps1 or provide -SSHUser parameter."
-        }
-        if ([string]::IsNullOrEmpty($config.SSHHost)) {
-            throw "SSH Host not configured. Run Setup-BackupCredentials.ps1 or provide -SSHHost parameter."
+        # If UseSFTP is set, validate SFTP configuration; otherwise validate SSH
+        if ($config.UseSFTP) {
+            # Validate SFTP configuration
+            if ([string]::IsNullOrEmpty($config.SFTPHost)) {
+                if ([string]::IsNullOrEmpty($config.SSHHost)) {
+                    throw "SFTP Host not configured. Run Setup-BackupCredentials.ps1 or provide -SFTPHost parameter."
+                }
+                # Fallback to SSH host if SFTP host not set
+                $config.SFTPHost = $config.SSHHost
+            }
+            if ([string]::IsNullOrEmpty($config.SFTPUser)) {
+                if ([string]::IsNullOrEmpty($config.SSHUser)) {
+                    throw "SFTP User not configured. Run Setup-BackupCredentials.ps1 or provide -SFTPUser parameter."
+                }
+                # Fallback to SSH user if SFTP user not set
+                $config.SFTPUser = $config.SSHUser
+            }
+            if (-not $config.SFTPPort) {
+                $config.SFTPPort = if ($config.SSHPort) { $config.SSHPort } else { 22 }
+            }
+            Write-Log "Using SFTP mode for file download" -Level Info
+            Write-Log "SFTP Host: $($config.SFTPHost)" -Level Info
+            Write-Log "SFTP User: $($config.SFTPUser)" -Level Info
+            Write-Log "SFTP Port: $($config.SFTPPort)" -Level Info
+        } else {
+            # Validate SSH configuration
+            if ([string]::IsNullOrEmpty($config.SSHUser)) {
+                throw "SSH User not configured. Run Setup-BackupCredentials.ps1 or provide -SSHUser parameter."
+            }
+            if ([string]::IsNullOrEmpty($config.SSHHost)) {
+                throw "SSH Host not configured. Run Setup-BackupCredentials.ps1 or provide -SSHHost parameter."
+            }
+            Write-Log "Using SSH streaming mode (default)" -Level Info
         }
         if ([string]::IsNullOrEmpty($config.RemotePath)) {
             throw "Remote Path not configured. Run Setup-BackupCredentials.ps1 or provide -RemotePath parameter."
@@ -1892,9 +1958,11 @@ function Get-StoredCredentials {
             throw "Google Drive Remote not configured. Run Setup-BackupCredentials.ps1 or provide -GDriveRemote parameter."
         }
         
-        Write-Log "SSH User: $($config.SSHUser)" -Level Info
-        Write-Log "SSH Host: $($config.SSHHost)" -Level Info
-        Write-Log "SSH Port: $($config.SSHPort)" -Level Info
+        if (-not $config.UseSFTP) {
+            Write-Log "SSH User: $($config.SSHUser)" -Level Info
+            Write-Log "SSH Host: $($config.SSHHost)" -Level Info
+            Write-Log "SSH Port: $($config.SSHPort)" -Level Info
+        }
         Write-Log "Remote Path: $($config.RemotePath)" -Level Info
         Write-Log "Google Drive Remote: $($config.GDriveRemote)" -Level Info
         Write-Log "Configuration loaded successfully" -Level Success
@@ -1976,34 +2044,76 @@ function Test-Prerequisites {
     
     $allPrereqsMet = $true
     
-    # Check SSH
-    try {
-        $sshCheck = Get-Command ssh -ErrorAction SilentlyContinue
-        if (-not $sshCheck) {
-            # Try common locations
-            $commonPaths = @(
-                "$env:SystemRoot\System32\OpenSSH\ssh.exe",
-                "$env:ProgramFiles\OpenSSH\ssh.exe",
-                "$env:ProgramFiles(x86)\OpenSSH\ssh.exe"
-            )
-            foreach ($path in $commonPaths) {
-                if (Test-Path $path) {
-                    $sshCheck = Get-Item $path
-                    break
+    # Check if SFTP mode is enabled
+    $config = Get-StoredCredentials -ErrorAction SilentlyContinue
+    $useSFTP = $false
+    if ($config -and $config.UseSFTP) {
+        $useSFTP = $true
+    } elseif ($script:UseSFTP) {
+        $useSFTP = $true
+    }
+    
+    if ($useSFTP) {
+        # Check for Posh-SSH module (required for SFTP)
+        Write-Log "SFTP mode enabled - checking for Posh-SSH module..." -Level Info
+        try {
+            $poshSSH = Get-Module -ListAvailable -Name Posh-SSH
+            if ($poshSSH) {
+                Write-Log "Posh-SSH module found (version $($poshSSH.Version))" -Level Success
+                # Import the module
+                Import-Module Posh-SSH -ErrorAction Stop
+                Write-Log "Posh-SSH module imported successfully" -Level Success
+            }
+            else {
+                Write-Log "Posh-SSH module not found. Attempting to install..." -Level Warning
+                try {
+                    Install-Module -Name Posh-SSH -Scope CurrentUser -Force -ErrorAction Stop
+                    Import-Module Posh-SSH -ErrorAction Stop
+                    Write-Log "Posh-SSH module installed and imported successfully" -Level Success
+                }
+                catch {
+                    Write-Log "Failed to install Posh-SSH module: $_" -Level Error
+                    Write-Log "Please install manually: Install-Module -Name Posh-SSH -Scope CurrentUser" -Level Error
+                    $allPrereqsMet = $false
                 }
             }
         }
-        if ($sshCheck) {
-            $sshPath = if ($sshCheck.Source) { $sshCheck.Source } else { $sshCheck.FullName }
-            Write-Log "SSH client found: $sshPath" -Level Success
-        }
-        else {
-            throw "SSH not found"
+        catch {
+            Write-Log "Posh-SSH module check failed: $_" -Level Error
+            Write-Log "Please install: Install-Module -Name Posh-SSH -Scope CurrentUser" -Level Error
+            $allPrereqsMet = $false
         }
     }
-    catch {
-        Write-Log "SSH client not found. Please install OpenSSH client." -Level Error
-        $allPrereqsMet = $false
+    else {
+        # Check SSH (for SSH streaming mode)
+        try {
+            $sshCheck = Get-Command ssh -ErrorAction SilentlyContinue
+            if (-not $sshCheck) {
+                # Try common locations
+                $commonPaths = @(
+                    "$env:SystemRoot\System32\OpenSSH\ssh.exe",
+                    "$env:ProgramFiles\OpenSSH\ssh.exe",
+                    "$env:ProgramFiles(x86)\OpenSSH\ssh.exe"
+                )
+                foreach ($path in $commonPaths) {
+                    if (Test-Path $path) {
+                        $sshCheck = Get-Item $path
+                        break
+                    }
+                }
+            }
+            if ($sshCheck) {
+                $sshPath = if ($sshCheck.Source) { $sshCheck.Source } else { $sshCheck.FullName }
+                Write-Log "SSH client found: $sshPath" -Level Success
+            }
+            else {
+                throw "SSH not found"
+            }
+        }
+        catch {
+            Write-Log "SSH client not found. Please install OpenSSH client." -Level Error
+            $allPrereqsMet = $false
+        }
     }
     
     # Check SCP
@@ -2072,6 +2182,28 @@ function Get-FileChecksum {
 function Get-BackupArchive {
     <#
     .SYNOPSIS
+        Creates backup archive using either SSH streaming or SFTP download.
+        SSH mode: Streams tar output directly from remote server (no server-side archive).
+        SFTP mode: Downloads files individually via SFTP and creates archive locally.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [hashtable]$Config
+    )
+    
+    # Check if SFTP mode is enabled
+    if ($Config.UseSFTP) {
+        return Get-BackupArchive-SFTP -Config $Config
+    }
+    else {
+        return Get-BackupArchive-SSH -Config $Config
+    }
+}
+
+function Get-BackupArchive-SSH {
+    <#
+    .SYNOPSIS
         Streams backup archive directly from remote server to local machine via SSH.
         No archive is created on the remote server - tar output streams directly through SSH.
     #>
@@ -2081,7 +2213,7 @@ function Get-BackupArchive {
         [hashtable]$Config
     )
     
-    Write-StepHeader "Streaming Backup from Remote Server"
+    Write-StepHeader "Streaming Backup from Remote Server (SSH Mode)"
     
     $stepStart = Get-Date
     
@@ -2402,6 +2534,365 @@ function Get-BackupArchive {
         $duration = (Get-Date) - $stepStart
         Write-Log "Failed to stream backup after $($duration.TotalSeconds.ToString('F2'))s: $_" -Level Error
         return $null
+    }
+}
+
+function Get-BackupArchive-SFTP {
+    <#
+    .SYNOPSIS
+        Downloads files from remote server via SFTP and creates backup archive locally.
+        More reliable than SSH streaming for large files, avoids corruption issues.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [hashtable]$Config
+    )
+    
+    Write-StepHeader "Downloading Backup via SFTP"
+    
+    $stepStart = Get-Date
+    $session = $null
+    $tempDownloadDir = $null
+    
+    try {
+        # Determine SFTP connection details
+        $sftpHost = if ($Config.SFTPHost) { $Config.SFTPHost } else { $Config.SSHHost }
+        $sftpUser = if ($Config.SFTPUser) { $Config.SFTPUser } else { $Config.SSHUser }
+        $sftpPort = if ($Config.SFTPPort) { $Config.SFTPPort } else { $Config.SSHPort }
+        
+        Write-Log "SFTP Host: $sftpHost" -Level Info
+        Write-Log "SFTP User: $sftpUser" -Level Info
+        Write-Log "SFTP Port: $sftpPort" -Level Info
+        Write-Log "Remote Path: $($Config.RemotePath)" -Level Info
+        
+        # Check if path contains wildcard
+        $hasWildcard = $Config.RemotePath -match '\*'
+        if ($hasWildcard) {
+            Write-Log "Wildcard pattern detected - will backup all matching directories" -Level Info
+        }
+        
+        if ($DryRun) {
+            Write-Log "[DRY RUN] Would download files via SFTP and create archive" -Level Warning
+            return @(Join-Path $LOCAL_BACKUP_DIR "$BACKUP_NAME_BASE.part001.tar.gz")
+        }
+        
+        # Ensure local directory exists
+        if (-not (Test-Path $LOCAL_BACKUP_DIR)) {
+            New-Item -Path $LOCAL_BACKUP_DIR -ItemType Directory -Force | Out-Null
+            Write-Log "Created local directory: $LOCAL_BACKUP_DIR" -Level Info
+        }
+        
+        # Create temporary directory for downloaded files
+        $tempDownloadDir = Join-Path $LOCAL_BACKUP_DIR "temp_$BACKUP_NAME_BASE"
+        if (Test-Path $tempDownloadDir) {
+            Remove-Item -Path $tempDownloadDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        New-Item -Path $tempDownloadDir -ItemType Directory -Force | Out-Null
+        Write-Log "Created temporary download directory: $tempDownloadDir" -Level Info
+        
+        # Connect to SFTP server
+        Write-Log "Connecting to SFTP server..." -Level Info
+        
+        $credential = $null
+        if ($Config.SFTPPassword) {
+            $credential = New-Object System.Management.Automation.PSCredential($sftpUser, $Config.SFTPPassword)
+        }
+        
+        $sessionParams = @{
+            ComputerName = $sftpHost
+            Port = $sftpPort
+            Credential = $credential
+            AcceptKey = $true
+        }
+        
+        # Use key file if provided
+        if ($Config.SFTPKeyPath -and (Test-Path $Config.SFTPKeyPath)) {
+            $sessionParams['KeyFile'] = $Config.SFTPKeyPath
+            Write-Log "Using SSH key file: $($Config.SFTPKeyPath)" -Level Info
+        }
+        elseif (-not $credential) {
+            # Try to use default SSH key
+            $defaultKeyPath = Join-Path $env:USERPROFILE ".ssh\id_rsa"
+            if (Test-Path $defaultKeyPath) {
+                $sessionParams['KeyFile'] = $defaultKeyPath
+                Write-Log "Using default SSH key: $defaultKeyPath" -Level Info
+            }
+        }
+        
+        try {
+            $session = New-SFTPSession @sessionParams -ErrorAction Stop
+            Write-Log "SFTP connection established successfully" -Level Success
+        }
+        catch {
+            Write-Log "Failed to connect to SFTP server: $_" -Level Error
+            throw "SFTP connection failed: $_"
+        }
+        
+        # Download files recursively
+        Write-Log "Starting file download..." -Level Info
+        Write-Log "This may take a while for large directories..." -Level Info
+        Write-Host ""
+        
+        $script:streamFileCount = 0
+        $script:streamBytesWritten = 0
+        $startTime = Get-Date
+        $lastReportTime = Get-Date
+        
+        # Function to download files recursively
+        function Download-SFTPDirectory {
+            param(
+                [Parameter(Mandatory=$true)]
+                $Session,
+                [Parameter(Mandatory=$true)]
+                [string]$RemotePath,
+                [Parameter(Mandatory=$true)]
+                [string]$LocalPath
+            )
+            
+            try {
+                $items = Get-SFTPChildItem -Session $Session -Path $RemotePath -ErrorAction Stop
+                
+                foreach ($item in $items) {
+                    $remoteItemPath = $item.FullName
+                    $localItemPath = Join-Path $LocalPath $item.Name
+                    
+                    if ($item.Attributes.IsDirectory) {
+                        # Create directory and recurse
+                        if (-not (Test-Path $localItemPath)) {
+                            New-Item -Path $localItemPath -ItemType Directory -Force | Out-Null
+                        }
+                        Download-SFTPDirectory -Session $Session -RemotePath $remoteItemPath -LocalPath $localItemPath
+                    }
+                    else {
+                        # Download file
+                        $script:streamFileCount++
+                        $script:streamBytesWritten += $item.Length
+                        
+                        # Show progress periodically
+                        $now = Get-Date
+                        if (($now - $lastReportTime).TotalSeconds -ge 5) {
+                            $totalSizeMB = [math]::Round($script:streamBytesWritten / 1MB, 1)
+                            $totalSizeGB = [math]::Round($script:streamBytesWritten / 1GB, 2)
+                            $elapsed = $now - $startTime
+                            $elapsedStr = "{0:hh\:mm\:ss}" -f $elapsed
+                            $totalDisplay = if ($totalSizeGB -ge 1) { "${totalSizeGB} GB" } else { "${totalSizeMB} MB" }
+                            
+                            # Calculate speed
+                            $elapsedSeconds = ($now - $startTime).TotalSeconds
+                            $speedMBps = if ($elapsedSeconds -gt 0) {
+                                [math]::Round($script:streamBytesWritten / $elapsedSeconds / 1MB, 2)
+                            } else { 0 }
+                            
+                            $displayPath = if ($remoteItemPath.Length -gt 60) { "..." + $remoteItemPath.Substring($remoteItemPath.Length - 57) } else { $remoteItemPath }
+                            Write-Host "`r  [$elapsedStr] Files: $($script:streamFileCount) | $totalDisplay | Speed: ${speedMBps} MB/s | $displayPath".PadRight(120) -NoNewline -ForegroundColor Cyan
+                            $lastReportTime = $now
+                        }
+                        
+                        Get-SFTPFile -Session $Session -RemoteFile $remoteItemPath -LocalPath $localItemPath -ErrorAction Stop | Out-Null
+                    }
+                }
+            }
+            catch {
+                Write-Log "Error downloading from $RemotePath : $_" -Level Warning
+                # Continue with other files
+            }
+        }
+        
+        # Handle wildcard paths
+        if ($hasWildcard) {
+            # For wildcard, we need to find matching directories first
+            Write-Log "Expanding wildcard pattern: $($Config.RemotePath)" -Level Info
+            $parentPath = Split-Path -Parent $Config.RemotePath
+            $pattern = Split-Path -Leaf $Config.RemotePath
+            
+            try {
+                $parentItems = Get-SFTPChildItem -Session $session -Path $parentPath -ErrorAction Stop
+                $matchingDirs = $parentItems | Where-Object { $_.Attributes.IsDirectory -and $_.Name -like $pattern }
+                
+                Write-Log "Found $($matchingDirs.Count) matching directories" -Level Info
+                
+                foreach ($dir in $matchingDirs) {
+                    $localDirPath = Join-Path $tempDownloadDir $dir.Name
+                    New-Item -Path $localDirPath -ItemType Directory -Force | Out-Null
+                    Download-SFTPDirectory -Session $session -RemotePath $dir.FullName -LocalPath $localDirPath
+                }
+            }
+            catch {
+                Write-Log "Failed to expand wildcard pattern: $_" -Level Error
+                throw
+            }
+        }
+        else {
+            # Single path - download directly
+            Download-SFTPDirectory -Session $session -RemotePath $Config.RemotePath -LocalPath $tempDownloadDir
+        }
+        
+        Write-Host ""
+        Write-Host ""
+        Write-Log "File download completed: $($script:streamFileCount) files, $([math]::Round($script:streamBytesWritten / 1GB, 2)) GB" -Level Success
+        
+        # Close SFTP session
+        if ($session) {
+            Remove-SFTPSession -Session $session | Out-Null
+            $session = $null
+        }
+        
+        # Create tar.gz archive from downloaded files
+        Write-Log "Creating compressed archive from downloaded files..." -Level Info
+        Write-Log "This may take a while..." -Level Info
+        
+        # Use tar to create archive, streaming to parts
+        $createdParts = [System.Collections.ArrayList]::new()
+        
+        # Create full archive first, then split if needed
+        $fullArchivePath = Join-Path $LOCAL_BACKUP_DIR "$BACKUP_NAME_BASE.tar.gz"
+        
+        # Use tar command to create compressed archive
+        Write-Log "Creating compressed archive..." -Level Info
+        $tarProcess = Start-Process -FilePath "tar" `
+            -ArgumentList "-czf", $fullArchivePath, "-C", $tempDownloadDir, "." `
+            -NoNewWindow -PassThru -Wait -ErrorAction Stop
+        
+        if ($tarProcess.ExitCode -ne 0) {
+            throw "Failed to create archive: tar exited with code $($tarProcess.ExitCode)"
+        }
+        
+        # Check if we need to split
+        $fullSize = (Get-Item $fullArchivePath).Length
+        $partSizeGB = [math]::Round($fullSize / 1GB, 2)
+        Write-Log "Archive created: $partSizeGB GB" -Level Info
+        
+        if ($fullSize -gt $SPLIT_SIZE_BYTES) {
+            Write-Log "Archive is larger than $SPLIT_SIZE_DISPLAY, splitting into parts..." -Level Info
+            
+            # Split the archive
+            $partNumber = 1
+            $bytesRead = 0
+            $bufferSize = 64KB
+            
+            $inputStream = [System.IO.File]::OpenRead($fullArchivePath)
+            try {
+                while ($bytesRead -lt $fullSize) {
+                    $partPath = Join-Path $LOCAL_BACKUP_DIR "$BACKUP_NAME_BASE.part$($partNumber.ToString('D3')).tar.gz"
+                    $outputStream = [System.IO.File]::Create($partPath)
+                    [void]$createdParts.Add($partPath)
+                    
+                    $bytesInPart = 0
+                    $buffer = New-Object byte[] $bufferSize
+                    
+                    while ($bytesInPart -lt $SPLIT_SIZE_BYTES -and $bytesRead -lt $fullSize) {
+                        $bytesToRead = [Math]::Min($bufferSize, $SPLIT_SIZE_BYTES - $bytesInPart, $fullSize - $bytesRead)
+                        $read = $inputStream.Read($buffer, 0, $bytesToRead)
+                        if ($read -eq 0) { break }
+                        
+                        $outputStream.Write($buffer, 0, $read)
+                        $bytesInPart += $read
+                        $bytesRead += $read
+                    }
+                    
+                    $outputStream.Close()
+                    $partSizeGB = [math]::Round($bytesInPart / 1GB, 2)
+                    Write-Log "Created part $partNumber : $partSizeGB GB" -Level Info
+                    $partNumber++
+                }
+            }
+            finally {
+                $inputStream.Close()
+                Remove-Item $fullArchivePath -Force -ErrorAction SilentlyContinue
+            }
+        }
+        else {
+            # Archive is small enough, use as single part
+            $singlePartPath = Join-Path $LOCAL_BACKUP_DIR "$BACKUP_NAME_BASE.part001.tar.gz"
+            Move-Item -Path $fullArchivePath -Destination $singlePartPath -Force
+            [void]$createdParts.Add($singlePartPath)
+            Write-Log "Archive created as single part: $partSizeGB GB" -Level Success
+        }
+        
+        # Clean up temporary download directory
+        Write-Log "Cleaning up temporary download directory..." -Level Info
+        Remove-Item -Path $tempDownloadDir -Recurse -Force -ErrorAction SilentlyContinue
+        
+        # Verify all backup parts and calculate checksums
+        Write-Log "Verifying local backup files and calculating checksums..." -Level Info
+        Write-Log "Total parts created: $($createdParts.Count)" -Level Info
+        
+        $totalSizeBytes = 0
+        $partNumber = 0
+        $checksums = @{}
+        
+        foreach ($partPath in $createdParts) {
+            $partNumber++
+            if (-not (Test-Path $partPath)) {
+                throw "Backup part not found after creation: $partPath"
+            }
+            
+            $partInfo = Get-Item $partPath
+            $partSizeBytes = $partInfo.Length
+            $partSizeMB = [math]::Round($partSizeBytes / 1MB, 2)
+            $partSizeGB = [math]::Round($partSizeBytes / 1GB, 2)
+            $partDisplay = if ($partSizeGB -ge 1) { "$partSizeGB GB" } else { "$partSizeMB MB" }
+            $totalSizeBytes += $partSizeBytes
+            
+            # Calculate checksum for this part
+            Write-Log "Calculating SHA256 checksum for part $partNumber..." -Level Info
+            $partName = Split-Path -Leaf $partPath
+            $checksum = Get-FileChecksum -FilePath $partPath
+            if ($checksum) {
+                $checksums[$partName] = $checksum
+                Write-Log "Part $partNumber : $partName - $partDisplay - SHA256: $checksum" -Level Info
+            } else {
+                Write-Log "WARNING: Failed to calculate checksum for part $partNumber" -Level Warning
+            }
+        }
+        
+        # Store checksums for later use
+        $script:backupChecksums = $checksums
+        $script:backupParts = $createdParts
+        
+        $totalSizeMB = [math]::Round($totalSizeBytes / 1MB, 2)
+        $totalSizeGB = [math]::Round($totalSizeBytes / 1GB, 2)
+        
+        Write-Log "All parts verified successfully" -Level Info
+        Write-Log "Total size (bytes): $totalSizeBytes" -Level Info
+        Write-Log "Total size (MB): $totalSizeMB" -Level Info
+        Write-Log "Total size (GB): $totalSizeGB" -Level Info
+        
+        $duration = (Get-Date) - $stepStart
+        $sizeDisplay = if ($totalSizeGB -ge 1) { "$totalSizeGB GB" } else { "$totalSizeMB MB" }
+        $transferRateMBps = [math]::Round($totalSizeMB / $duration.TotalSeconds, 2)
+        
+        Write-Log "========================================" -Level Success
+        Write-Log "SFTP backup completed successfully!" -Level Success
+        Write-Log "========================================" -Level Success
+        Write-Log "Total parts: $($createdParts.Count)" -Level Info
+        Write-Log "Total size: $sizeDisplay" -Level Info
+        Write-Log "Files downloaded: $($script:streamFileCount)" -Level Info
+        Write-Log "Duration: $($duration.TotalSeconds.ToString('F2'))s ($([math]::Round($duration.TotalMinutes, 1)) minutes)" -Level Info
+        Write-Log "Average transfer rate: $transferRateMBps MB/s" -Level Info
+        
+        return $createdParts.ToArray()
+    }
+    catch {
+        $duration = (Get-Date) - $stepStart
+        Write-Log "Failed to download backup via SFTP after $($duration.TotalSeconds.ToString('F2'))s: $_" -Level Error
+        Write-Log $_.ScriptStackTrace -Level Error
+        
+        # Cleanup on error
+        if ($session) {
+            Remove-SFTPSession -Session $session -ErrorAction SilentlyContinue | Out-Null
+        }
+        if ($tempDownloadDir -and (Test-Path $tempDownloadDir)) {
+            Remove-Item -Path $tempDownloadDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        
+        return $null
+    }
+    finally {
+        if ($session) {
+            Remove-SFTPSession -Session $session -ErrorAction SilentlyContinue | Out-Null
+        }
     }
 }
 
@@ -3153,9 +3644,14 @@ function Invoke-Backup {
             Write-Log "Backing up directory: $($config.RemotePath)" -Level Info
         }
         
-        # Test SSH connection
-        if (-not (Test-SSHConnection -Config $config)) {
-            throw "SSH connection test failed"
+        # Test connection (SSH or SFTP)
+        if ($config.UseSFTP) {
+            # SFTP connection will be tested during download
+            Write-Log "SFTP mode: Connection will be tested during download" -Level Info
+        } else {
+            if (-not (Test-SSHConnection -Config $config)) {
+                throw "SSH connection test failed"
+            }
         }
         
         # Stream backup directly from remote server to local machine
@@ -3330,6 +3826,19 @@ Please check the log file for error details.
 # =============================================================================
 
 try {
+    # Assign parameters to script-scoped variables for use in functions
+    $script:SSHUser = $SSHUser
+    $script:SSHHost = $SSHHost
+    $script:SSHPort = $SSHPort
+    $script:RemotePath = $RemotePath
+    $script:GDriveRemote = $GDriveRemote
+    $script:UseSFTP = $UseSFTP
+    $script:SFTPHost = $SFTPHost
+    $script:SFTPPort = if ($SFTPPort) { $SFTPPort } else { 22 }
+    $script:SFTPUser = $SFTPUser
+    $script:SFTPPassword = $SFTPPassword
+    $script:SFTPKeyPath = $SFTPKeyPath
+    
     # For Monthly/Quarterly schedules, check if today is the right day to run
     if ($NonInteractive) {
         $scheduleInfo = Get-BackupScheduleInfo

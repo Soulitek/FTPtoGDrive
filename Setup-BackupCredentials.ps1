@@ -340,6 +340,11 @@ function Save-Configuration {
         Set-ItemProperty -Path $REGISTRY_PATH -Name "SSHPort" -Value $Config.SSHPort
         Set-ItemProperty -Path $REGISTRY_PATH -Name "RemotePath" -Value $Config.RemotePath
         Set-ItemProperty -Path $REGISTRY_PATH -Name "GDriveRemote" -Value $Config.GDriveRemote
+        if ($Config.UseSFTP) {
+            Set-ItemProperty -Path $REGISTRY_PATH -Name "UseSFTP" -Value 1
+        } else {
+            Set-ItemProperty -Path $REGISTRY_PATH -Name "UseSFTP" -Value 0
+        }
         Set-ItemProperty -Path $REGISTRY_PATH -Name "ConfiguredDate" -Value (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
         
         Write-ColorMessage "✓ Configuration saved to registry: $REGISTRY_PATH" -Type Success
@@ -528,11 +533,33 @@ function Start-Setup {
         
         Write-ColorMessage "Enter Google Drive remote path (e.g., gdrive:backups/website):" -Type Question
         $config.GDriveRemote = Read-Host
+        
+        # Ask about SFTP mode
+        Write-Host ""
+        Write-ColorMessage "Transfer Method:" -Type Question
+        Write-Host "  [1] SSH Streaming (default - faster, but may have corruption issues with large files)" -ForegroundColor White
+        Write-Host "  [2] SFTP Download (more reliable, downloads files individually)" -ForegroundColor White
+        Write-Host ""
+        $transferChoice = Read-Host "Select transfer method [1 or 2, default: 1]"
+        
+        if ($transferChoice -eq '2') {
+            $config.UseSFTP = $true
+            Write-ColorMessage "SFTP mode selected - files will be downloaded individually" -Type Info
+            Write-ColorMessage "Note: Posh-SSH module will be installed automatically if needed" -Type Info
+        } else {
+            $config.UseSFTP = $false
+            Write-ColorMessage "SSH streaming mode selected (default)" -Type Info
+        }
+    }
+    else {
+        # Non-interactive mode - default to SSH streaming unless explicitly set
+        $config.UseSFTP = $false
     }
     
     # Display configuration
     Write-Host ""
     Write-ColorMessage "Configuration Summary:" -Type Info
+    Write-Host "  Transfer Method:   $(if ($config.UseSFTP) { 'SFTP Download' } else { 'SSH Streaming' })" -ForegroundColor Yellow
     Write-Host "  SSH User:          $($config.SSHUser)" -ForegroundColor Yellow
     Write-Host "  SSH Host:          $($config.SSHHost)" -ForegroundColor Yellow
     Write-Host "  SSH Port:          $($config.SSHPort)" -ForegroundColor Yellow
@@ -540,21 +567,27 @@ function Start-Setup {
     Write-Host "  Google Drive:      $($config.GDriveRemote)" -ForegroundColor Yellow
     Write-Host ""
     
-    # Step 3: Test SSH connection
-    Write-SectionHeader "Step 3: Testing SSH Connection"
-    
-    if (-not (Test-SSHConnection -User $config.SSHUser -Hostname $config.SSHHost -Port $config.SSHPort)) {
-        Write-ColorMessage "SSH connection test failed. Please check your configuration and SSH key setup" -Type Error
+    # Step 3: Test connection (SSH or SFTP)
+    if ($config.UseSFTP) {
+        Write-SectionHeader "Step 3: SFTP Mode Selected"
+        Write-ColorMessage "SFTP connection will be tested during the first backup" -Type Info
+        Write-ColorMessage "Note: Posh-SSH module will be installed automatically if needed" -Type Info
+    } else {
+        Write-SectionHeader "Step 3: Testing SSH Connection"
         
-        if (-not $NonInteractive) {
-            Write-ColorMessage "Do you want to continue anyway? (Y/N)" -Type Question
-            $response = Read-Host
-            if ($response -ne 'Y' -and $response -ne 'y') {
+        if (-not (Test-SSHConnection -User $config.SSHUser -Hostname $config.SSHHost -Port $config.SSHPort)) {
+            Write-ColorMessage "SSH connection test failed. Please check your configuration and SSH key setup" -Type Error
+            
+            if (-not $NonInteractive) {
+                Write-ColorMessage "Do you want to continue anyway? (Y/N)" -Type Question
+                $response = Read-Host
+                if ($response -ne 'Y' -and $response -ne 'y') {
+                    return $false
+                }
+            }
+            else {
                 return $false
             }
-        }
-        else {
-            return $false
         }
     }
     
