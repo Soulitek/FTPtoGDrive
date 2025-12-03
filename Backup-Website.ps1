@@ -469,6 +469,9 @@ function Show-Configuration {
     Write-Host "  CURRENT BACKUP CONFIGURATION" -ForegroundColor Cyan
     Write-Host ("=" * 80) -ForegroundColor Cyan
     Write-Host ""
+    $transferMethod = if ($Config.UseSFTP) { "SFTP Download" } else { "SSH Streaming" }
+    Write-Host "  Transfer Method:  " -NoNewline -ForegroundColor Gray
+    Write-Host "$transferMethod" -ForegroundColor $(if ($Config.UseSFTP) { "Green" } else { "Yellow" })
     Write-Host "  SSH Server:       " -NoNewline -ForegroundColor Gray
     Write-Host "$($Config.SSHUser)@$($Config.SSHHost):$($Config.SSHPort)" -ForegroundColor Yellow
     Write-Host "  Website Path:     " -NoNewline -ForegroundColor Gray
@@ -1866,7 +1869,7 @@ function Get-StoredCredentials {
             SSHPort = $script:SSHPort
             RemotePath = $script:RemotePath
             GDriveRemote = $script:GDriveRemote
-            UseSFTP = $script:UseSFTP
+            UseSFTP = if ($script:UseSFTP) { $script:UseSFTP } else { $false }
             SFTPHost = $script:SFTPHost
             SFTPPort = $script:SFTPPort
             SFTPUser = $script:SFTPUser
@@ -1888,15 +1891,29 @@ function Get-StoredCredentials {
                     if ([string]::IsNullOrEmpty($config.SSHHost)) { $config.SSHHost = $regConfig.SSHHost }
                     if ([string]::IsNullOrEmpty($config.RemotePath)) { $config.RemotePath = $regConfig.RemotePath }
                     if ([string]::IsNullOrEmpty($config.GDriveRemote)) { $config.GDriveRemote = $regConfig.GDriveRemote }
-                    # Load SFTP settings if available
-                    if ($regConfig.UseSFTP) { $config.UseSFTP = [bool]$regConfig.UseSFTP }
-                    if ($regConfig.SFTPHost) { $config.SFTPHost = $regConfig.SFTPHost }
-                    if ($regConfig.SFTPPort) { $config.SFTPPort = $regConfig.SFTPPort }
-                    if ($regConfig.SFTPUser) { $config.SFTPUser = $regConfig.SFTPUser }
-                    if ($regConfig.SFTPKeyPath) { $config.SFTPKeyPath = $regConfig.SFTPKeyPath }
+                    # Load SFTP settings if available (check if property exists first)
+                    if ($regConfig.PSObject.Properties.Name -contains 'UseSFTP') {
+                        $config.UseSFTP = [bool]$regConfig.UseSFTP
+                    }
+                    if ($regConfig.PSObject.Properties.Name -contains 'SFTPHost' -and $regConfig.SFTPHost) {
+                        $config.SFTPHost = $regConfig.SFTPHost
+                    }
+                    if ($regConfig.PSObject.Properties.Name -contains 'SFTPPort' -and $regConfig.SFTPPort) {
+                        $config.SFTPPort = $regConfig.SFTPPort
+                    }
+                    if ($regConfig.PSObject.Properties.Name -contains 'SFTPUser' -and $regConfig.SFTPUser) {
+                        $config.SFTPUser = $regConfig.SFTPUser
+                    }
+                    if ($regConfig.PSObject.Properties.Name -contains 'SFTPKeyPath' -and $regConfig.SFTPKeyPath) {
+                        $config.SFTPKeyPath = $regConfig.SFTPKeyPath
+                    }
                     # Load schedule information if available
-                    if ($regConfig.ScheduleFrequency) { $config.ScheduleFrequency = $regConfig.ScheduleFrequency }
-                    if ($regConfig.ScheduleTime) { $config.ScheduleTime = $regConfig.ScheduleTime }
+                    if ($regConfig.PSObject.Properties.Name -contains 'ScheduleFrequency' -and $regConfig.ScheduleFrequency) {
+                        $config.ScheduleFrequency = $regConfig.ScheduleFrequency
+                    }
+                    if ($regConfig.PSObject.Properties.Name -contains 'ScheduleTime' -and $regConfig.ScheduleTime) {
+                        $config.ScheduleTime = $regConfig.ScheduleTime
+                    }
                 }
             }
         } else {
@@ -1905,14 +1922,28 @@ function Get-StoredCredentials {
             if (Test-Path $regPath) {
                 $regConfig = Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue
                 if ($regConfig) {
-                    # Load SFTP settings if not provided as parameters
-                    if (-not $config.UseSFTP -and $regConfig.UseSFTP) { $config.UseSFTP = [bool]$regConfig.UseSFTP }
-                    if ([string]::IsNullOrEmpty($config.SFTPHost) -and $regConfig.SFTPHost) { $config.SFTPHost = $regConfig.SFTPHost }
-                    if (-not $config.SFTPPort -and $regConfig.SFTPPort) { $config.SFTPPort = $regConfig.SFTPPort }
-                    if ([string]::IsNullOrEmpty($config.SFTPUser) -and $regConfig.SFTPUser) { $config.SFTPUser = $regConfig.SFTPUser }
-                    if ([string]::IsNullOrEmpty($config.SFTPKeyPath) -and $regConfig.SFTPKeyPath) { $config.SFTPKeyPath = $regConfig.SFTPKeyPath }
-                    if ($regConfig.ScheduleFrequency) { $config.ScheduleFrequency = $regConfig.ScheduleFrequency }
-                    if ($regConfig.ScheduleTime) { $config.ScheduleTime = $regConfig.ScheduleTime }
+                    # Load SFTP settings if not provided as parameters (check if property exists first)
+                    if (-not $config.UseSFTP -and $regConfig.PSObject.Properties.Name -contains 'UseSFTP') {
+                        $config.UseSFTP = [bool]$regConfig.UseSFTP
+                    }
+                    if ([string]::IsNullOrEmpty($config.SFTPHost) -and $regConfig.PSObject.Properties.Name -contains 'SFTPHost' -and $regConfig.SFTPHost) {
+                        $config.SFTPHost = $regConfig.SFTPHost
+                    }
+                    if (-not $config.SFTPPort -and $regConfig.PSObject.Properties.Name -contains 'SFTPPort' -and $regConfig.SFTPPort) {
+                        $config.SFTPPort = $regConfig.SFTPPort
+                    }
+                    if ([string]::IsNullOrEmpty($config.SFTPUser) -and $regConfig.PSObject.Properties.Name -contains 'SFTPUser' -and $regConfig.SFTPUser) {
+                        $config.SFTPUser = $regConfig.SFTPUser
+                    }
+                    if ([string]::IsNullOrEmpty($config.SFTPKeyPath) -and $regConfig.PSObject.Properties.Name -contains 'SFTPKeyPath' -and $regConfig.SFTPKeyPath) {
+                        $config.SFTPKeyPath = $regConfig.SFTPKeyPath
+                    }
+                    if ($regConfig.PSObject.Properties.Name -contains 'ScheduleFrequency' -and $regConfig.ScheduleFrequency) {
+                        $config.ScheduleFrequency = $regConfig.ScheduleFrequency
+                    }
+                    if ($regConfig.PSObject.Properties.Name -contains 'ScheduleTime' -and $regConfig.ScheduleTime) {
+                        $config.ScheduleTime = $regConfig.ScheduleTime
+                    }
                 }
             }
         }
@@ -3910,10 +3941,13 @@ try {
             Write-Host "  [4] Manage schedule" -ForegroundColor White
             Write-Host "  [5] Delete configuration (start fresh)" -ForegroundColor White
             Write-Host "  [6] Run backup locally only (choose save location)" -ForegroundColor White
+            $currentMethod = if ($config.UseSFTP) { "SFTP Download" } else { "SSH Streaming" }
+            $toggleTo = if ($config.UseSFTP) { "SSH Streaming" } else { "SFTP Download" }
+            Write-Host "  [7] Toggle transfer method (Current: $currentMethod → Switch to: $toggleTo)" -ForegroundColor White
             Write-Host "  [Q] Quit" -ForegroundColor White
             Write-Host ""
             
-            $choice = Read-UserChoice -Prompt "Choice" -ValidChoices @('1', '2', '3', '4', '5', '6', 'Q', '') -DefaultChoice '1'
+            $choice = Read-UserChoice -Prompt "Choice" -ValidChoices @('1', '2', '3', '4', '5', '6', '7', 'Q', '') -DefaultChoice '1'
             
             switch ($choice) {
                 '2' {
@@ -3985,6 +4019,48 @@ try {
                     }
                     else {
                         Write-ColorMessage "Backup cancelled - no directory selected." -Type Warning
+                        exit 0
+                    }
+                }
+                '7' {
+                    # Toggle SFTP mode
+                    Write-Host ""
+                    $regPath = "HKCU:\Software\WebsiteBackup"
+                    $newSFTPValue = -not $config.UseSFTP
+                    $newMethod = if ($newSFTPValue) { "SFTP Download" } else { "SSH Streaming" }
+                    
+                    Write-ColorMessage "Toggling transfer method..." -Type Info
+                    Write-ColorMessage "Current: $(if ($config.UseSFTP) { 'SFTP Download' } else { 'SSH Streaming' })" -Type Info
+                    Write-ColorMessage "Switching to: $newMethod" -Type Info
+                    Write-Host ""
+                    
+                    try {
+                        if (-not (Test-Path $regPath)) {
+                            New-Item -Path $regPath -Force | Out-Null
+                        }
+                        
+                        Set-ItemProperty -Path $regPath -Name "UseSFTP" -Value ([int]$newSFTPValue) -ErrorAction Stop
+                        
+                        Write-ColorMessage "✓ Transfer method updated successfully!" -Type Success
+                        Write-ColorMessage "New method: $newMethod" -Type Success
+                        Write-Host ""
+                        
+                        if ($newSFTPValue) {
+                            Write-ColorMessage "Note: Posh-SSH module will be installed automatically if needed" -Type Info
+                        }
+                        
+                        Write-Host ""
+                        Write-ColorMessage "Configuration updated. Restarting script to apply changes..." -Type Info
+                        Start-Sleep -Seconds 2
+                        
+                        # Restart the script to reload configuration
+                        & $PSCommandPath
+                        exit 0
+                    }
+                    catch {
+                        Write-ColorMessage "✗ Failed to update transfer method: $_" -Type Error
+                        Write-Host ""
+                        Read-Host "Press Enter to continue"
                         exit 0
                     }
                 }
